@@ -1,6 +1,8 @@
 
-- more theme (difference color than purple)
+
 - tempo should not be with float most of the time (maybe base on the most common tempo in industry and take closest or other method)
+    BEST SOLUTION: find a more elaborated library (IA?) to detect key and tempo
+- more theme (difference color than purple)
 - check metadata online
 - fix name (metadata) at exportation (copy) in folder
 - waveform viewer more definition and grid match peaks
