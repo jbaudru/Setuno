@@ -14,3 +14,6 @@
 - user can click where he want in the navigation/progress bar of the played song
 - allow to change column width in the playlist and library views
 - allow to click on album cover art in the player to see a larger view
+
+- .exe and macOS versions
+- README
