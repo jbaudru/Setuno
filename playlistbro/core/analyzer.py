@@ -1,8 +1,11 @@
 """Audio analysis: tempo, musical key, energy, loudness and genre extraction.
 
-Deliberately dependency-light: decoding uses `miniaudio`, and all DSP
-(STFT, onset, tempo, chroma, loudness and genre features) is implemented
-with plain numpy so the packaged app stays small and portable.
+Decoding uses `miniaudio`; most DSP (STFT, onset, chroma, loudness and
+genre features) is implemented with plain numpy so the packaged app stays
+small and portable. Tempo and key detection prefer `librosa`'s
+beat-tracking and chroma algorithms when that (optional) dependency is
+installed, since they are noticeably more accurate than the numpy-only
+fallbacks kept here for portability.
 """
 
 import hashlib
@@ -131,8 +134,13 @@ def _read_tags(filepath: str) -> dict:
     return tags
 
 
-def _extract_cover(filepath: str) -> str:
-    """Cache embedded album art and return its path, or an empty string."""
+def _extract_cover(filepath: str, force: bool = False) -> str:
+    """Cache embedded album art and return its path, or an empty string.
+
+    Pass `force=True` after the embedded art has just been changed, so the
+    on-disk thumbnail cache (keyed only by filepath) is refreshed instead of
+    silently keeping the old image.
+    """
     try:
         from mutagen import File as MutagenFile
 
@@ -173,13 +181,119 @@ def _extract_cover(filepath: str) -> str:
 
         out_path = cover_dir / f"{digest}{ext}"
 
-        if not out_path.exists():
+        if force:
+            for stale_ext in (".png", ".jpg"):
+                (cover_dir / f"{digest}{stale_ext}").unlink(missing_ok=True)
+
+        if force or not out_path.exists():
             out_path.write_bytes(data)
 
         return str(out_path)
 
     except Exception:
         return ""
+
+
+def set_cover_art(filepath: str, image_path: str) -> str:
+    """Embed `image_path` as cover art directly in `filepath`.
+
+    Returns the refreshed cached thumbnail path, or "" on failure/unsupported
+    format. Embedding into the real file (rather than just the app's cache)
+    means a later rescan naturally picks up the new artwork too.
+    """
+    ext = Path(filepath).suffix.lower()
+    mime = "image/png" if image_path.lower().endswith(".png") else "image/jpeg"
+
+    try:
+        image_bytes = Path(image_path).read_bytes()
+
+        if ext in (".mp3", ".wav"):
+            from mutagen.id3 import ID3, ID3NoHeaderError, APIC
+
+            try:
+                tags = ID3(filepath)
+            except ID3NoHeaderError:
+                tags = ID3()
+
+            tags.delall("APIC")
+            tags.add(APIC(encoding=3, mime=mime, type=3, desc="Cover", data=image_bytes))
+            tags.save(filepath)
+
+        elif ext == ".flac":
+            from mutagen.flac import FLAC, Picture
+
+            audio = FLAC(filepath)
+            audio.clear_pictures()
+
+            picture = Picture()
+            picture.data = image_bytes
+            picture.mime = mime
+            picture.type = 3
+            audio.add_picture(picture)
+            audio.save()
+
+        elif ext == ".ogg":
+            import base64
+
+            from mutagen.flac import Picture
+            from mutagen.oggvorbis import OggVorbis
+
+            picture = Picture()
+            picture.data = image_bytes
+            picture.mime = mime
+            picture.type = 3
+
+            audio = OggVorbis(filepath)
+            audio["metadata_block_picture"] = [
+                base64.b64encode(picture.write()).decode("ascii")
+            ]
+            audio.save()
+
+        else:
+            return ""
+
+    except Exception:
+        return ""
+
+    return _extract_cover(filepath, force=True)
+
+
+def clear_cover_art(filepath: str) -> str:
+    """Remove embedded cover art from `filepath`. Always returns \"\"."""
+    ext = Path(filepath).suffix.lower()
+
+    try:
+        if ext in (".mp3", ".wav"):
+            from mutagen.id3 import ID3, ID3NoHeaderError
+
+            try:
+                tags = ID3(filepath)
+            except ID3NoHeaderError:
+                return ""
+
+            tags.delall("APIC")
+            tags.save(filepath)
+
+        elif ext == ".flac":
+            from mutagen.flac import FLAC
+
+            audio = FLAC(filepath)
+            audio.clear_pictures()
+            audio.save()
+
+        elif ext == ".ogg":
+            from mutagen.oggvorbis import OggVorbis
+
+            audio = OggVorbis(filepath)
+
+            if "metadata_block_picture" in audio:
+                del audio["metadata_block_picture"]
+                audio.save()
+
+    except Exception:
+        pass
+
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -1671,6 +1785,104 @@ def _detect_key(chroma: np.ndarray) -> str:
     )
 
 
+def _vote_key_from_chroma_segments(
+    chroma_frames: np.ndarray,
+    fallback_chroma: np.ndarray,
+) -> str:
+    """Confidence-weighted key voting shared by the STFT and librosa paths.
+
+    `chroma_frames` is a (frames, 12) array of per-frame chroma vectors,
+    divided into several temporal segments so a vocal intro, breakdown or
+    outro can't single-handedly determine the key.
+    """
+    n_frames = chroma_frames.shape[0]
+
+    if n_frames == 0:
+        return _detect_key(fallback_chroma)
+
+    n_segments = min(
+        12,
+        max(
+            4,
+            n_frames // 8,
+        ),
+    )
+
+    boundaries = np.linspace(
+        0,
+        n_frames,
+        n_segments + 1,
+        dtype=int,
+    )
+
+    key_votes = np.zeros(24, dtype=np.float64)
+
+    for segment_index in range(n_segments):
+        start = boundaries[segment_index]
+        end = boundaries[segment_index + 1]
+
+        if end <= start:
+            continue
+
+        chroma = chroma_frames[start:end].mean(axis=0)
+
+        total = chroma.sum()
+
+        if total <= 1e-12:
+            continue
+
+        chroma = chroma / total
+
+        scores = []
+
+        for i in range(12):
+            major = np.roll(MAJOR_PROFILE, i)
+            minor = np.roll(MINOR_PROFILE, i)
+
+            scores.append(_key_profile_score(chroma, major))
+            scores.append(_key_profile_score(chroma, minor))
+
+        scores = np.asarray(scores, dtype=np.float64)
+
+        # Segment confidence is based on the separation between the first
+        # and second candidates.
+        ordered = np.sort(scores)
+
+        confidence = (
+            max(0.05, ordered[-1] - ordered[-2])
+            if len(ordered) >= 2
+            else 0.05
+        )
+
+        # Longer segments receive slightly more weight.
+        duration_weight = (end - start) / max(1, n_frames)
+
+        weight = confidence * (0.5 + duration_weight)
+
+        # Add a soft vote to the strongest candidates rather than using only
+        # one hard decision.
+        best_indices = np.argsort(scores)[-3:]
+
+        for rank, key_index in enumerate(best_indices):
+            rank_weight = 1.0 if rank == 2 else 0.55 if rank == 1 else 0.25
+            key_votes[key_index] += weight * rank_weight
+
+    if key_votes.max() <= 0:
+        return _detect_key(fallback_chroma)
+
+    best_index = int(np.argmax(key_votes))
+
+    note_index = best_index // 2
+    mode_index = best_index % 2
+
+    mode = "major" if mode_index == 0 else "minor"
+
+    return normalize_key_name(
+        NOTE_NAMES[note_index],
+        mode,
+    )
+
+
 def _detect_key_from_stft(
     key_mag: np.ndarray,
     sr: int,
@@ -1683,8 +1895,8 @@ def _detect_key_from_stft(
             "major",
         )
 
-    # Divide the track into several temporal regions. This avoids a vocal
-    # intro, breakdown or outro completely determining the key.
+    # Divide the track into several temporal regions up front, then build
+    # one chroma vector per segment for the shared voting logic.
     n_frames = key_mag.shape[0]
 
     n_segments = min(
@@ -1702,160 +1914,83 @@ def _detect_key_from_stft(
         dtype=int,
     )
 
-    key_votes = np.zeros(
-        24,
-        dtype=np.float64,
-    )
+    chroma_frames = np.zeros((n_segments, 12), dtype=np.float64)
 
-    for segment_index in range(
-        n_segments
-    ):
-        start = boundaries[
-            segment_index
-        ]
-
-        end = boundaries[
-            segment_index + 1
-        ]
+    for segment_index in range(n_segments):
+        start = boundaries[segment_index]
+        end = boundaries[segment_index + 1]
 
         if end <= start:
             continue
 
-        segment_mag = key_mag[
-            start:end
-        ]
-
-        chroma = _chroma_from_spectrum(
-            segment_mag,
+        chroma_frames[segment_index] = _chroma_from_spectrum(
+            key_mag[start:end],
             sr,
             frame_size,
         )
 
-        if chroma.sum() <= 1e-12:
-            continue
+    fallback_chroma = _chroma_from_spectrum(key_mag, sr, frame_size)
 
-        scores = []
+    return _vote_key_from_chroma_segments(chroma_frames, fallback_chroma)
 
-        for i in range(12):
-            major = np.roll(
-                MAJOR_PROFILE,
-                i,
-            )
 
-            minor = np.roll(
-                MINOR_PROFILE,
-                i,
-            )
+def _estimate_tempo_librosa(y: np.ndarray, sr: int):
+    """Try the librosa dynamic-programming beat tracker for a BPM estimate.
 
-            major_score = _key_profile_score(
-                chroma,
-                major,
-            )
+    Returns None (rather than raising) if librosa isn't installed or the
+    estimate fails, so the lightweight NumPy fallback always still works.
+    """
+    try:
+        import librosa
+    except Exception:
+        return None
 
-            minor_score = _key_profile_score(
-                chroma,
-                minor,
-            )
-
-            scores.append(
-                major_score
-            )
-
-            scores.append(
-                minor_score
-            )
-
-        scores = np.asarray(
-            scores,
-            dtype=np.float64,
+    try:
+        tempo = librosa.feature.tempo(
+            y=y.astype(np.float32),
+            sr=sr,
+            start_bpm=120.0,
+            max_tempo=MAX_BPM,
         )
 
-        # Segment confidence is based on the separation between the first
-        # and second candidates.
-        ordered = np.sort(
-            scores
+        bpm = float(tempo[0])
+    except Exception:
+        return None
+
+    if not np.isfinite(bpm) or bpm <= 0:
+        return None
+
+    # Fold octave errors (half/double time) into our supported BPM range.
+    while bpm < MIN_BPM:
+        bpm *= 2.0
+
+    while bpm > MAX_BPM:
+        bpm /= 2.0
+
+    return bpm
+
+
+def _detect_key_librosa(y: np.ndarray, sr: int):
+    """Try librosa's constant-Q chroma for key detection. None on failure."""
+    try:
+        import librosa
+    except Exception:
+        return None
+
+    try:
+        chroma = librosa.feature.chroma_cqt(
+            y=y.astype(np.float32),
+            sr=sr,
+            hop_length=KEY_HOP_SIZE,
         )
+    except Exception:
+        return None
 
-        confidence = (
-            max(
-                0.05,
-                ordered[-1]
-                - ordered[-2],
-            )
-            if len(ordered) >= 2
-            else 0.05
-        )
+    frames = chroma.T  # (n_frames, 12), pitch class 0 = C, matching NOTE_NAMES
 
-        # Longer segments receive slightly more weight.
-        duration_weight = (
-            end - start
-        ) / max(
-            1,
-            n_frames,
-        )
+    fallback_chroma = frames.mean(axis=0) if frames.shape[0] else np.zeros(12)
 
-        weight = (
-            confidence
-            * (
-                0.5
-                + duration_weight
-            )
-        )
-
-        # Add a soft vote to the strongest candidates rather than using only
-        # one hard decision.
-        best_indices = np.argsort(
-            scores
-        )[-3:]
-
-        for rank, key_index in enumerate(
-            best_indices
-        ):
-            rank_weight = (
-                1.0
-                if rank == 2
-                else 0.55
-                if rank == 1
-                else 0.25
-            )
-
-            key_votes[
-                key_index
-            ] += (
-                weight
-                * rank_weight
-            )
-
-    if key_votes.max() <= 0:
-        chroma = _chroma_from_spectrum(
-            key_mag,
-            sr,
-            frame_size,
-        )
-
-        return _detect_key(
-            chroma
-        )
-
-    best_index = int(
-        np.argmax(
-            key_votes
-        )
-    )
-
-    note_index = best_index // 2
-    mode_index = best_index % 2
-
-    mode = (
-        "major"
-        if mode_index == 0
-        else "minor"
-    )
-
-    return normalize_key_name(
-        NOTE_NAMES[note_index],
-        mode,
-    )
+    return _vote_key_from_chroma_segments(frames, fallback_chroma)
 
 
 # ---------------------------------------------------------------------------
@@ -2559,6 +2694,7 @@ def _clean_genre_tag(genre: str) -> str:
         "hip hop": "Hip-Hop",
         "hip-hop": "Hip-Hop",
         "hiphop": "Hip-Hop",
+        "rap": "Hip-Hop",
         "r&b": "R&B",
         "rnb": "R&B",
         "drum and bass": "Drum & Bass",
@@ -2570,13 +2706,41 @@ def _clean_genre_tag(genre: str) -> str:
         "deep house": "Deep House",
         "tech house": "Tech House",
         "minimal techno": "Minimal Techno",
+        "melodic techno": "Melodic Techno",
         "hard techno": "Hard Techno",
         "hardstyle": "Hardstyle",
         "progressive house": "Progressive House",
+        "big room": "Big Room",
+        "big room house": "Big Room",
         "trance": "Trance",
+        "psytrance": "Psytrance",
+        "psy trance": "Psytrance",
         "dubstep": "Dubstep",
         "breakbeat": "Breakbeat",
         "breaks": "Breakbeat",
+        "trap": "Trap",
+        "future bass": "Future Bass",
+        "synthwave": "Synthwave",
+        "synth wave": "Synthwave",
+        "retrowave": "Synthwave",
+        "disco": "Disco",
+        "funk": "Funk",
+        "jazz": "Jazz",
+        "reggaeton": "Reggaeton",
+        "afrobeat": "Afrobeat",
+        "afrobeats": "Afrobeat",
+        "reggae": "Reggae",
+        "lofi": "Lo-Fi",
+        "lo-fi": "Lo-Fi",
+        "lo fi": "Lo-Fi",
+        "chillhop": "Lo-Fi",
+        "metal": "Metal",
+        "indie": "Indie/Alternative",
+        "alternative": "Indie/Alternative",
+        "indie rock": "Indie/Alternative",
+        "classical": "Classical",
+        "acoustic": "Acoustic/Folk",
+        "folk": "Acoustic/Folk",
     }
 
     return aliases.get(
@@ -2585,17 +2749,265 @@ def _clean_genre_tag(genre: str) -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# Nearest-profile genre classifier
+#
+# Instead of a bespoke cascade of hand-tuned if/else rules, each genre is
+# described by a short profile: a target BPM (mean, std) plus target values
+# for a handful of normalized spectral/rhythmic descriptors that are
+# actually distinctive for that genre. Classifying a track is then a
+# Gaussian nearest-centroid match: score every profile against the track's
+# feature vector and keep the closest one. Broad catch-all genres (Pop,
+# Electronic, Downtempo, ...) simply use low weights/wide tolerances, so
+# they naturally win only when nothing more specific fits well -- no
+# separate fallback logic needed. Extending genre coverage is just adding
+# one more table entry.
+# ---------------------------------------------------------------------------
+
+GENRE_PROFILES = {
+    # -- House family --------------------------------------------------
+    "House": {
+        "bpm": (123, 6), "bass": (0.22, 0.07), "onset_density": (0.28, 0.10),
+        "rhythmic_regularity": (0.55, 0.15), "flatness": (0.28, 0.10),
+    },
+    "Deep House": {
+        "bpm": (122, 5), "bass": (0.26, 0.06), "centroid": (0.32, 0.08),
+        "harmonicity": (0.15, 0.06), "high": (0.14, 0.07), "flatness": (0.22, 0.08),
+    },
+    "Tech House": {
+        "bpm": (127, 4), "bass": (0.22, 0.06), "onset_density": (0.32, 0.08),
+        "flatness": (0.34, 0.08), "centroid": (0.40, 0.09),
+    },
+    "Progressive House": {
+        "bpm": (126, 6), "harmonicity": (0.18, 0.06), "onset_variability": (0.6, 0.20),
+        "centroid": (0.40, 0.10), "rolloff": (0.60, 0.14), "rhythmic_regularity": (0.55, 0.15),
+    },
+    "Big Room": {
+        "bpm": (128, 3), "bass": (0.26, 0.06), "loudness": (1.0, 0.20),
+        "rhythmic_regularity": (0.65, 0.12), "onset_density": (0.30, 0.09),
+    },
+
+    # -- Techno / trance family -----------------------------------------
+    "Melodic Techno": {
+        "bpm": (123, 4), "harmonicity": (0.18, 0.05), "bass": (0.24, 0.07),
+        "onset_density": (0.24, 0.07), "rhythmic_regularity": (0.60, 0.12), "centroid": (0.32, 0.08),
+    },
+    "Minimal Techno": {
+        "bpm": (126, 5), "bass": (0.20, 0.07), "onset_density": (0.20, 0.07),
+        "flatness": (0.28, 0.09), "centroid": (0.34, 0.09), "rhythmic_regularity": (0.60, 0.13),
+    },
+    "Techno": {
+        "bpm": (133, 6), "flatness": (0.36, 0.08), "onset_density": (0.34, 0.08),
+        "harmonicity": (0.08, 0.05), "centroid": (0.42, 0.10), "rhythmic_regularity": (0.55, 0.13),
+    },
+    "Hard Techno": {
+        "bpm": (148, 6), "brightness": (0.18, 0.06), "flatness": (0.40, 0.08),
+        "onset_density": (0.36, 0.08), "centroid": (0.46, 0.10), "rhythmic_regularity": (0.50, 0.13),
+    },
+    "Trance": {
+        "bpm": (136, 6), "harmonicity": (0.20, 0.06), "high": (0.28, 0.08),
+        "rolloff": (0.70, 0.14), "centroid": (0.52, 0.10), "brightness": (0.22, 0.06),
+    },
+    "Psytrance": {
+        "bpm": (145, 4), "flatness": (0.42, 0.08), "onset_density": (0.40, 0.08),
+        "brightness": (0.24, 0.06), "harmonicity": (0.08, 0.05),
+    },
+    "Hardstyle": {
+        "bpm": (150, 4), "bass": (0.24, 0.06), "brightness": (0.22, 0.06),
+        "flatness": (0.40, 0.08), "onset_density": (0.34, 0.08),
+    },
+
+    # -- Bass / breaks family --------------------------------------------
+    "UK Garage": {
+        "bpm": (136, 6), "bass": (0.20, 0.07), "onset_variability": (0.55, 0.18),
+        "harmonicity": (0.10, 0.06), "rhythmic_regularity": (0.42, 0.13),
+    },
+    "Breakbeat": {
+        "bpm": (128, 14), "onset_variability": (0.65, 0.16), "rhythmic_regularity": (0.35, 0.11),
+        "bass": (0.18, 0.08),
+    },
+    "Dubstep": {
+        "bpm": (142, 6), "bass": (0.28, 0.06), "onset_variability": (0.65, 0.16),
+        "centroid": (0.36, 0.09), "flatness": (0.36, 0.08), "rhythmic_regularity": (0.40, 0.12),
+    },
+    "Future Bass": {
+        "bpm": (150, 8), "harmonicity": (0.18, 0.06), "brightness": (0.28, 0.07),
+        "centroid": (0.55, 0.10), "onset_density": (0.28, 0.08),
+    },
+    "Trap": {
+        "bpm": (140, 22), "bass": (0.28, 0.06), "onset_variability": (0.75, 0.16),
+        "harmonicity": (0.08, 0.06), "rhythmic_regularity": (0.35, 0.11),
+    },
+    "Drum & Bass": {
+        "bpm": (172, 10), "bass": (0.22, 0.07), "onset_density": (0.38, 0.08),
+        "onset_variability": (0.60, 0.16), "flatness": (0.34, 0.09), "rhythmic_regularity": (0.40, 0.12),
+    },
+
+    # -- Groove / vocal-led genres ----------------------------------------
+    "Synthwave": {
+        "bpm": (98, 14), "harmonicity": (0.22, 0.06), "centroid": (0.38, 0.09),
+        "flatness": (0.20, 0.08), "onset_density": (0.18, 0.07), "brightness": (0.20, 0.06),
+    },
+    "Disco": {
+        "bpm": (117, 6), "harmonicity": (0.20, 0.06), "mid": (0.44, 0.08),
+        "onset_density": (0.24, 0.08), "rhythmic_regularity": (0.55, 0.13), "zcr": (0.40, 0.14),
+    },
+    "Funk": {
+        "bpm": (102, 14), "harmonicity": (0.22, 0.06), "zcr": (0.55, 0.14),
+        "onset_variability": (0.5, 0.18), "mid": (0.42, 0.09),
+    },
+    "Reggaeton": {
+        "bpm": (92, 6), "bass": (0.24, 0.06), "onset_variability": (0.45, 0.14),
+        "rhythmic_regularity": (0.55, 0.12),
+    },
+    "Afrobeat": {
+        "bpm": (105, 10), "harmonicity": (0.16, 0.06), "onset_variability": (0.55, 0.16),
+        "rhythmic_regularity": (0.50, 0.14), "bass": (0.18, 0.08),
+    },
+    "Reggae": {
+        "bpm": (75, 10), "bass": (0.22, 0.07), "harmonicity": (0.16, 0.06),
+        "rhythmic_regularity": (0.50, 0.14), "onset_density": (0.16, 0.07),
+    },
+    "Hip-Hop": {
+        "bpm": (90, 14), "bass": (0.24, 0.06), "harmonicity": (0.14, 0.06),
+        "centroid": (0.32, 0.09), "onset_variability": (0.35, 0.13),
+    },
+    "R&B": {
+        "bpm": (85, 16), "harmonicity": (0.20, 0.05), "centroid": (0.30, 0.08),
+        "bass": (0.20, 0.07), "flatness": (0.20, 0.08),
+    },
+
+    # -- Chill / acoustic / orchestral -------------------------------------
+    "Lo-Fi": {
+        "bpm": (78, 12), "onset_density": (0.12, 0.06), "harmonicity": (0.16, 0.06),
+        "flatness": (0.18, 0.07), "centroid": (0.26, 0.08), "brightness": (0.14, 0.06),
+    },
+    "Downtempo": {
+        "bpm": (85, 16), "centroid": (0.30, 0.09), "onset_density": (0.14, 0.07),
+        "harmonicity": (0.14, 0.07), "flatness": (0.22, 0.09),
+    },
+    "Ambient": {
+        "bpm": (75, 22), "onset_density": (0.06, 0.05), "harmonicity": (0.18, 0.08),
+        "flatness": (0.16, 0.08), "onset_variability": (0.4, 0.20),
+    },
+    "Jazz": {
+        "bpm": (120, 30), "harmonicity": (0.28, 0.05), "flatness": (0.12, 0.06),
+        "onset_variability": (0.7, 0.20), "rhythmic_regularity": (0.25, 0.10),
+    },
+    "Classical": {
+        "bpm": (90, 32), "harmonicity": (0.30, 0.05), "flatness": (0.08, 0.05),
+        "onset_density": (0.08, 0.05), "zcr": (0.20, 0.10),
+    },
+    "Acoustic/Folk": {
+        "bpm": (100, 22), "harmonicity": (0.24, 0.06), "flatness": (0.14, 0.07),
+        "zcr": (0.30, 0.12), "onset_density": (0.14, 0.07),
+    },
+
+    # -- Rock / metal / indie ----------------------------------------------
+    "Metal": {
+        "bpm": (140, 22), "zcr": (0.75, 0.14), "centroid": (0.48, 0.10),
+        "flatness": (0.30, 0.09), "harmonicity": (0.12, 0.06),
+    },
+    "Rock": {
+        "bpm": (118, 20), "harmonicity": (0.18, 0.06), "centroid": (0.44, 0.10),
+        "zcr": (0.45, 0.14), "high": (0.20, 0.08), "flatness": (0.18, 0.08),
+    },
+    "Indie/Alternative": {
+        "bpm": (112, 18), "harmonicity": (0.16, 0.06), "centroid": (0.36, 0.09),
+        "zcr": (0.32, 0.13), "flatness": (0.16, 0.08),
+    },
+
+    # -- Broad catch-alls (win only when nothing specific fits well) ------
+    "Pop": {
+        "bpm": (112, 16), "harmonicity": (0.14, 0.07), "flatness": (0.24, 0.10),
+        "high": (0.20, 0.09), "loudness": (0.9, 0.25), "centroid": (0.40, 0.11),
+    },
+    "Electronic": {
+        "bpm": (135, 28), "bass": (0.16, 0.09), "onset_density": (0.22, 0.10),
+        "flatness": (0.22, 0.10), "rhythmic_regularity": (0.4, 0.16),
+    },
+}
+
+
+def _feature_vector(features: dict, tempo: float) -> dict:
+    """Build the normalized feature vector consumed by the genre classifier."""
+    bpm = float(
+        tempo
+        if tempo > 0
+        else features.get("tempo", 120.0)
+    )
+
+    def clipped(value: float, scale: float) -> float:
+        return float(np.clip(value / scale, 0.0, 2.0))
+
+    return {
+        "bpm": bpm,
+        "centroid": clipped(float(features.get("spectral_centroid", 2000.0)), 5000.0),
+        "rolloff": clipped(float(features.get("spectral_rolloff", 5000.0)), 8000.0),
+        "flatness": float(features.get("spectral_flatness", 0.3)),
+        "bass": float(features.get("bass_ratio", 0.2)),
+        "low_mid": float(features.get("low_mid_ratio", 0.2)),
+        "mid": float(features.get("mid_ratio", 0.4)),
+        "high": float(features.get("high_ratio", 0.2)),
+        "brightness": float(features.get("brightness", 0.15)),
+        "harmonicity": float(features.get("harmonicity", 0.1)),
+        "onset_density": float(features.get("onset_density", 0.2)),
+        "onset_variability": clipped(float(features.get("onset_variability", 1.0)), 3.0),
+        "rhythmic_regularity": float(features.get("rhythmic_regularity", 0.5)),
+        "zcr": clipped(float(features.get("zero_crossing_rate", 0.05)), 0.15),
+        "loudness": clipped(float(features.get("loudness", -14.0)) + 30.0, 30.0),
+    }
+
+
+FEATURE_IMPORTANCE = 6.0  # how much a perfect non-BPM feature match can outweigh BPM
+
+
+def _profile_score(vector: dict, profile: dict) -> float:
+    """Similarity between a track's feature vector and a genre profile.
+
+    BPM uses a proper Gaussian log-density (`-0.5*z**2 - log(std)`), so a
+    genre with a tight, confident BPM range scores higher at its own peak
+    than a vague, wide-tolerance one -- not the other way around.
+
+    The remaining features are scored as a bounded 0-1 "closeness"
+    (`exp(-0.5*z**2)`, 1.0 = exact match) and averaged rather than summed,
+    so a profile listing more distinctive features isn't penalized just for
+    describing itself in more detail, and doesn't automatically win just by
+    listing many features either. That average is then scaled by
+    `FEATURE_IMPORTANCE` so genres with a naturally wide BPM range (Rock,
+    Jazz, Classical, ...) can still win on the strength of their other,
+    more distinctive features. Unlisted features simply aren't compared.
+    """
+    bpm_mean, bpm_std = profile["bpm"]
+    z = (vector["bpm"] - bpm_mean) / bpm_std
+    score = -0.5 * z * z - np.log(bpm_std)
+
+    feature_keys = [key for key in profile if key != "bpm"]
+
+    if feature_keys:
+        closeness_sum = 0.0
+
+        for key in feature_keys:
+            target, tolerance = profile[key]
+            z = (vector[key] - target) / tolerance
+            closeness_sum += np.exp(-0.5 * z * z)
+
+        score += FEATURE_IMPORTANCE * (closeness_sum / len(feature_keys))
+
+    return score
+
+
 def _estimate_genre(
     tags: dict,
     tempo: float,
 ) -> str:
-    """Estimate genre using BPM families plus spectral/rhythmic descriptors.
+    """Estimate genre via nearest-profile matching over a normalized feature space.
 
-    BPM is used as a strong prior rather than as the sole classifier.
-    Genres with incompatible tempo ranges are strongly penalized, while
-    spectral and rhythmic features distinguish genres within each family.
+    A file's own genre tag always wins when present. Otherwise every genre
+    in GENRE_PROFILES is scored against the track's BPM and spectral/
+    rhythmic descriptors (see `_feature_vector`/`_profile_score`), and the
+    closest match is returned.
     """
-
     metadata_genre = _clean_genre_tag(
         tags.get("genre", "")
     )
@@ -2608,959 +3020,16 @@ def _estimate_genre(
         {},
     )
 
-    bpm = float(
-        tempo
-        if tempo > 0
-        else features.get("tempo", 120.0)
-    )
+    vector = _feature_vector(features, tempo)
 
-    centroid = float(
-        features.get("spectral_centroid", 2000.0)
-    )
+    scores = {
+        genre: _profile_score(vector, profile)
+        for genre, profile in GENRE_PROFILES.items()
+    }
 
-    rolloff = float(
-        features.get("spectral_rolloff", 5000.0)
-    )
+    return max(scores, key=scores.get)
 
-    flatness = float(
-        features.get("spectral_flatness", 0.3)
-    )
 
-    bass = float(
-        features.get("bass_ratio", 0.2)
-    )
-
-    low_mid = float(
-        features.get("low_mid_ratio", 0.2)
-    )
-
-    mid = float(
-        features.get("mid_ratio", 0.4)
-    )
-
-    high = float(
-        features.get("high_ratio", 0.2)
-    )
-
-    brightness = float(
-        features.get("brightness", 0.15)
-    )
-
-    harmonicity = float(
-        features.get("harmonicity", 0.1)
-    )
-
-    onset_density = float(
-        features.get("onset_density", 0.2)
-    )
-
-    onset_variability = float(
-        features.get("onset_variability", 1.0)
-    )
-
-    rhythmic_regularity = float(
-        features.get("rhythmic_regularity", 0.5)
-    )
-
-    zcr = float(
-        features.get("zero_crossing_rate", 0.05)
-    )
-
-    loudness = float(
-        features.get("loudness", -14.0)
-    )
-
-    # ---------------------------------------------------------------
-    # Helpers
-    # ---------------------------------------------------------------
-
-    scores = {}
-
-    def add(name: str, score: float):
-        scores[name] = scores.get(name, 0.0) + max(
-            0.0,
-            float(score),
-        )
-
-    def in_range(
-        value: float,
-        low: float,
-        high: float,
-        weight: float,
-    ) -> float:
-        return weight if low <= value <= high else 0.0
-
-    # ---------------------------------------------------------------
-    # Tempo families
-    #
-    # These are deliberately broad. They are used as strong priors,
-    # not absolute rules.
-    # ---------------------------------------------------------------
-
-    is_slow = bpm < 100
-    is_mid = 100 <= bpm < 118
-    is_house = 116 <= bpm <= 134
-    is_fast_house = 128 <= bpm <= 140
-    is_fast_electronic = 135 <= bpm <= 160
-    is_dnb = 155 <= bpm <= 195
-
-    # ---------------------------------------------------------------
-    # House
-    # ---------------------------------------------------------------
-
-    house = 0.0
-
-    house += in_range(
-        bpm,
-        118,
-        130,
-        4.0,
-    )
-
-    house += in_range(
-        bpm,
-        113,
-        117.9,
-        1.2,
-    )
-
-    house += in_range(
-        bpm,
-        130.1,
-        134,
-        1.2,
-    )
-
-    if bass >= 0.16:
-        house += 0.8
-
-    if 0.10 <= onset_density <= 0.45:
-        house += 0.8
-
-    if flatness < 0.45:
-        house += 0.4
-
-    if rhythmic_regularity > 0.45:
-        house += 0.5
-
-    add(
-        "House",
-        house,
-    )
-
-    # ---------------------------------------------------------------
-    # Deep House
-    #
-    # Do NOT inherit the House score.
-    # ---------------------------------------------------------------
-
-    deep_house = 0.0
-
-    deep_house += in_range(
-        bpm,
-        118,
-        126,
-        4.5,
-    )
-
-    deep_house += in_range(
-        bpm,
-        126,
-        130,
-        1.0,
-    )
-
-    if bass >= 0.20:
-        deep_house += 1.2
-
-    if centroid < 2600:
-        deep_house += 1.0
-
-    if high < 0.25:
-        deep_house += 0.7
-
-    if harmonicity > 0.08:
-        deep_house += 0.5
-
-    if flatness < 0.35:
-        deep_house += 0.4
-
-    # Strong penalty outside the normal Deep House range.
-    if bpm > 132:
-        deep_house *= 0.05
-
-    if bpm < 112:
-        deep_house *= 0.15
-
-    add(
-        "Deep House",
-        deep_house,
-    )
-
-    # ---------------------------------------------------------------
-    # Tech House
-    # ---------------------------------------------------------------
-
-    tech_house = 0.0
-
-    tech_house += in_range(
-        bpm,
-        124,
-        130,
-        4.0,
-    )
-
-    if bass >= 0.16:
-        tech_house += 0.9
-
-    if onset_density >= 0.18:
-        tech_house += 0.9
-
-    if flatness >= 0.18:
-        tech_house += 0.7
-
-    if centroid >= 1800:
-        tech_house += 0.6
-
-    if rhythmic_regularity > 0.40:
-        tech_house += 0.4
-
-    if bpm > 136:
-        tech_house *= 0.05
-
-    add(
-        "Tech House",
-        tech_house,
-    )
-
-    # ---------------------------------------------------------------
-    # Progressive House
-    # ---------------------------------------------------------------
-
-    progressive = 0.0
-
-    progressive += in_range(
-        bpm,
-        120,
-        132,
-        3.5,
-    )
-
-    if onset_variability < 2.5:
-        progressive += 0.8
-
-    if harmonicity > 0.10:
-        progressive += 0.8
-
-    if centroid < 3500:
-        progressive += 0.5
-
-    if rolloff > 4500:
-        progressive += 0.5
-
-    if rhythmic_regularity > 0.45:
-        progressive += 0.4
-
-    if bpm > 138:
-        progressive *= 0.05
-
-    add(
-        "Progressive House",
-        progressive,
-    )
-
-    # ---------------------------------------------------------------
-    # Minimal Techno
-    # ---------------------------------------------------------------
-
-    minimal = 0.0
-
-    minimal += in_range(
-        bpm,
-        120,
-        132,
-        3.2,
-    )
-
-    if bass >= 0.15:
-        minimal += 0.9
-
-    if onset_density < 0.28:
-        minimal += 1.0
-
-    if flatness < 0.35:
-        minimal += 0.5
-
-    if centroid < 3000:
-        minimal += 0.6
-
-    if rhythmic_regularity > 0.50:
-        minimal += 0.5
-
-    if bpm > 138:
-        minimal *= 0.05
-
-    add(
-        "Minimal Techno",
-        minimal,
-    )
-
-    # ---------------------------------------------------------------
-    # Techno
-    # ---------------------------------------------------------------
-
-    techno = 0.0
-
-    techno += in_range(
-        bpm,
-        125,
-        140,
-        3.5,
-    )
-
-    if flatness > 0.18:
-        techno += 0.9
-
-    if onset_density >= 0.20:
-        techno += 0.9
-
-    if harmonicity < 0.18:
-        techno += 0.7
-
-    if centroid >= 1800:
-        techno += 0.6
-
-    if rhythmic_regularity > 0.45:
-        techno += 0.5
-
-    # Techno remains plausible above 140, but gets less suitable
-    # compared with Hard Techno.
-    if bpm > 145:
-        techno *= 0.35
-
-    add(
-        "Techno",
-        techno,
-    )
-
-    # ---------------------------------------------------------------
-    # Hard Techno
-    # ---------------------------------------------------------------
-
-    hard_techno = 0.0
-
-    hard_techno += in_range(
-        bpm,
-        140,
-        160,
-        4.5,
-    )
-
-    hard_techno += in_range(
-        bpm,
-        135,
-        139.9,
-        1.5,
-    )
-
-    if brightness > 0.10:
-        hard_techno += 0.8
-
-    if flatness > 0.20:
-        hard_techno += 0.8
-
-    if onset_density > 0.20:
-        hard_techno += 1.0
-
-    if centroid >= 1800:
-        hard_techno += 0.5
-
-    if rhythmic_regularity > 0.40:
-        hard_techno += 0.4
-
-    add(
-        "Hard Techno",
-        hard_techno,
-    )
-
-    # ---------------------------------------------------------------
-    # Trance
-    # ---------------------------------------------------------------
-
-    trance = 0.0
-
-    trance += in_range(
-        bpm,
-        128,
-        145,
-        4.0,
-    )
-
-    if harmonicity > 0.12:
-        trance += 1.2
-
-    if high > 0.18:
-        trance += 0.8
-
-    if rolloff > 5000:
-        trance += 0.8
-
-    if centroid > 2500:
-        trance += 0.6
-
-    if brightness > 0.15:
-        trance += 0.5
-
-    if rhythmic_regularity > 0.45:
-        trance += 0.4
-
-    add(
-        "Trance",
-        trance,
-    )
-
-    # ---------------------------------------------------------------
-    # UK Garage
-    # ---------------------------------------------------------------
-
-    ukg = 0.0
-
-    ukg += in_range(
-        bpm,
-        128,
-        145,
-        3.5,
-    )
-
-    if 135 <= bpm <= 145:
-        ukg += 1.0
-
-    if bass >= 0.15:
-        ukg += 0.9
-
-    if onset_variability > 1.2:
-        ukg += 1.0
-
-    if harmonicity > 0.07:
-        ukg += 0.5
-
-    if rhythmic_regularity < 0.55:
-        ukg += 0.5
-
-    add(
-        "UK Garage",
-        ukg,
-    )
-
-    # ---------------------------------------------------------------
-    # Breakbeat
-    # ---------------------------------------------------------------
-
-    breakbeat = 0.0
-
-    breakbeat += in_range(
-        bpm,
-        110,
-        145,
-        2.5,
-    )
-
-    if onset_variability > 1.4:
-        breakbeat += 1.5
-
-    if rhythmic_regularity < 0.70:
-        breakbeat += 1.0
-
-    if bass > 0.12:
-        breakbeat += 0.5
-
-    if onset_density > 0.18:
-        breakbeat += 0.4
-
-    add(
-        "Breakbeat",
-        breakbeat,
-    )
-
-    # ---------------------------------------------------------------
-    # Dubstep
-    # ---------------------------------------------------------------
-
-    dubstep = 0.0
-
-    dubstep += in_range(
-        bpm,
-        135,
-        150,
-        3.5,
-    )
-
-    if bass >= 0.22:
-        dubstep += 1.5
-
-    if onset_variability > 1.5:
-        dubstep += 1.0
-
-    if centroid < 2500:
-        dubstep += 0.7
-
-    if flatness > 0.20:
-        dubstep += 0.5
-
-    if rhythmic_regularity < 0.60:
-        dubstep += 0.6
-
-    add(
-        "Dubstep",
-        dubstep,
-    )
-
-    # ---------------------------------------------------------------
-    # Drum & Bass
-    # ---------------------------------------------------------------
-
-    dnb = 0.0
-
-    dnb += in_range(
-        bpm,
-        160,
-        190,
-        4.5,
-    )
-
-    dnb += in_range(
-        bpm,
-        155,
-        159.9,
-        1.5,
-    )
-
-    if bass >= 0.18:
-        dnb += 0.8
-
-    if onset_density >= 0.25:
-        dnb += 1.0
-
-    if onset_variability > 1.5:
-        dnb += 0.8
-
-    if flatness > 0.20:
-        dnb += 0.5
-
-    if rhythmic_regularity < 0.65:
-        dnb += 0.5
-
-    add(
-        "Drum & Bass",
-        dnb,
-    )
-
-    # ---------------------------------------------------------------
-    # Hardstyle
-    # ---------------------------------------------------------------
-
-    hardstyle = 0.0
-
-    hardstyle += in_range(
-        bpm,
-        145,
-        155,
-        4.0,
-    )
-
-    if bpm >= 150:
-        hardstyle += 0.8
-
-    if bass >= 0.20:
-        hardstyle += 0.8
-
-    if brightness > 0.12:
-        hardstyle += 0.8
-
-    if flatness > 0.22:
-        hardstyle += 0.8
-
-    if onset_density > 0.25:
-        hardstyle += 0.8
-
-    if centroid > 2200:
-        hardstyle += 0.5
-
-    add(
-        "Hardstyle",
-        hardstyle,
-    )
-
-    # ---------------------------------------------------------------
-    # Hip-Hop
-    # ---------------------------------------------------------------
-
-    hiphop = 0.0
-
-    hiphop += in_range(
-        bpm,
-        65,
-        105,
-        3.5,
-    )
-
-    if bass >= 0.18:
-        hiphop += 0.9
-
-    if harmonicity > 0.10:
-        hiphop += 0.7
-
-    if centroid < 2800:
-        hiphop += 0.6
-
-    if onset_variability > 1.0:
-        hiphop += 0.4
-
-    add(
-        "Hip-Hop",
-        hiphop,
-    )
-
-    # ---------------------------------------------------------------
-    # R&B
-    # ---------------------------------------------------------------
-
-    rnb = 0.0
-
-    rnb += in_range(
-        bpm,
-        65,
-        110,
-        3.0,
-    )
-
-    if harmonicity > 0.15:
-        rnb += 1.2
-
-    if centroid < 3000:
-        rnb += 0.8
-
-    if bass >= 0.15:
-        rnb += 0.7
-
-    if flatness < 0.35:
-        rnb += 0.5
-
-    add(
-        "R&B",
-        rnb,
-    )
-
-    # ---------------------------------------------------------------
-    # Downtempo
-    # ---------------------------------------------------------------
-
-    downtempo = 0.0
-
-    downtempo += in_range(
-        bpm,
-        60,
-        100,
-        3.0,
-    )
-
-    if centroid < 2200:
-        downtempo += 0.9
-
-    if onset_density < 0.20:
-        downtempo += 1.0
-
-    if harmonicity > 0.10:
-        downtempo += 0.5
-
-    if flatness < 0.30:
-        downtempo += 0.4
-
-    add(
-        "Downtempo",
-        downtempo,
-    )
-
-    # ---------------------------------------------------------------
-    # Ambient
-    # ---------------------------------------------------------------
-
-    ambient = 0.0
-
-    ambient += in_range(
-        bpm,
-        40,
-        100,
-        2.0,
-    )
-
-    if onset_density < 0.12:
-        ambient += 1.8
-
-    if harmonicity > 0.15:
-        ambient += 1.0
-
-    if flatness < 0.25:
-        ambient += 0.7
-
-    if onset_variability < 2.0:
-        ambient += 0.5
-
-    if centroid < 2500:
-        ambient += 0.5
-
-    add(
-        "Ambient",
-        ambient,
-    )
-
-    # ---------------------------------------------------------------
-    # Pop
-    # ---------------------------------------------------------------
-
-    pop = 0.0
-
-    pop += in_range(
-        bpm,
-        90,
-        135,
-        2.0,
-    )
-
-    if harmonicity > 0.10:
-        pop += 1.0
-
-    if 0.15 <= flatness <= 0.45:
-        pop += 0.7
-
-    if 0.12 <= high <= 0.35:
-        pop += 0.6
-
-    if loudness > -10:
-        pop += 0.4
-
-    if centroid > 1800:
-        pop += 0.4
-
-    add(
-        "Pop",
-        pop,
-    )
-
-    # ---------------------------------------------------------------
-    # Rock
-    # ---------------------------------------------------------------
-
-    rock = 0.0
-
-    rock += in_range(
-        bpm,
-        90,
-        150,
-        1.5,
-    )
-
-    if harmonicity > 0.14:
-        rock += 1.2
-
-    if centroid > 2200:
-        rock += 0.8
-
-    if zcr > 0.06:
-        rock += 0.7
-
-    if high > 0.15:
-        rock += 0.6
-
-    if flatness > 0.15:
-        rock += 0.4
-
-    add(
-        "Rock",
-        rock,
-    )
-
-    # ---------------------------------------------------------------
-    # Electronic
-    #
-    # Generic fallback for electronic music that does not fit one of
-    # the more specific electronic genres.
-    # ---------------------------------------------------------------
-
-    electronic = 0.0
-
-    if 100 <= bpm <= 180:
-        electronic += 1.5
-
-    if bass >= 0.12:
-        electronic += 0.7
-
-    if onset_density >= 0.15:
-        electronic += 0.7
-
-    if flatness >= 0.15:
-        electronic += 0.6
-
-    if centroid >= 1500:
-        electronic += 0.5
-
-    if rhythmic_regularity > 0.35:
-        electronic += 0.4
-
-    add(
-        "Electronic",
-        electronic,
-    )
-
-    # ---------------------------------------------------------------
-    # BPM-family penalties
-    #
-    # These prevent a spectrally dark 145 BPM track from accidentally
-    # becoming Deep House, for example.
-    # ---------------------------------------------------------------
-
-    def multiply(name: str, factor: float):
-        if name in scores:
-            scores[name] *= factor
-
-    # < 110 BPM
-    if bpm < 110:
-        multiply("House", 0.10)
-        multiply("Deep House", 0.10)
-        multiply("Tech House", 0.05)
-        multiply("Progressive House", 0.10)
-        multiply("Minimal Techno", 0.05)
-        multiply("Techno", 0.05)
-        multiply("Hard Techno", 0.01)
-        multiply("Trance", 0.05)
-        multiply("UK Garage", 0.05)
-        multiply("Breakbeat", 0.40)
-        multiply("Dubstep", 0.05)
-        multiply("Drum & Bass", 0.01)
-        multiply("Hardstyle", 0.01)
-
-    # 110-116 BPM
-    elif bpm < 116:
-        multiply("Deep House", 0.35)
-        multiply("Tech House", 0.20)
-        multiply("Minimal Techno", 0.15)
-        multiply("Hard Techno", 0.01)
-        multiply("Drum & Bass", 0.01)
-        multiply("Hardstyle", 0.01)
-
-    # 116-134 BPM: house/electronic territory
-    elif bpm <= 134:
-        multiply("Hard Techno", 0.05)
-        multiply("Hardstyle", 0.01)
-        multiply("Drum & Bass", 0.01)
-
-    # 135-139 BPM
-    elif bpm < 140:
-        multiply("Deep House", 0.03)
-        multiply("Tech House", 0.10)
-        multiply("Progressive House", 0.10)
-        multiply("Minimal Techno", 0.15)
-        multiply("House", 0.20)
-
-    # 140-144 BPM
-    elif bpm < 145:
-        multiply("Deep House", 0.01)
-        multiply("House", 0.03)
-        multiply("Tech House", 0.03)
-        multiply("Progressive House", 0.03)
-        multiply("Minimal Techno", 0.05)
-
-    # 145-154 BPM
-    elif bpm < 155:
-        multiply("Deep House", 0.005)
-        multiply("House", 0.01)
-        multiply("Tech House", 0.01)
-        multiply("Progressive House", 0.01)
-        multiply("Minimal Techno", 0.02)
-
-    # 155-159 BPM
-    elif bpm < 160:
-        multiply("Deep House", 0.001)
-        multiply("House", 0.001)
-        multiply("Tech House", 0.001)
-        multiply("Progressive House", 0.001)
-        multiply("Minimal Techno", 0.005)
-
-    # 160+ BPM: DnB / high-tempo electronic
-    else:
-        multiply("Deep House", 0.001)
-        multiply("House", 0.001)
-        multiply("Tech House", 0.001)
-        multiply("Progressive House", 0.001)
-        multiply("Minimal Techno", 0.001)
-
-    # ---------------------------------------------------------------
-    # Additional family-specific adjustments
-    # ---------------------------------------------------------------
-
-    # At 140+ BPM, Hard Techno / Trance / Dubstep / Hardstyle should
-    # generally be more competitive than House-family genres.
-    if 140 <= bpm <= 160:
-        if brightness > 0.10:
-            scores["Hard Techno"] *= 1.10
-
-        if flatness > 0.20:
-            scores["Hard Techno"] *= 1.10
-
-        if harmonicity > 0.12:
-            scores["Trance"] *= 1.10
-
-        if bass > 0.22:
-            scores["Dubstep"] *= 1.10
-
-    # Strong breakbeat characteristics.
-    if 110 <= bpm <= 150:
-        if rhythmic_regularity < 0.55:
-            scores["Breakbeat"] *= 1.15
-
-        if onset_variability > 1.4:
-            scores["Breakbeat"] *= 1.15
-
-    # Strong DnB characteristics.
-    if 155 <= bpm <= 195:
-        if onset_density > 0.25:
-            scores["Drum & Bass"] *= 1.15
-
-        if onset_variability > 1.5:
-            scores["Drum & Bass"] *= 1.10
-
-    # ---------------------------------------------------------------
-    # Select result
-    # ---------------------------------------------------------------
-
-    if not scores:
-        return "Unknown"
-
-    ranked = sorted(
-        scores.items(),
-        key=lambda item: item[1],
-        reverse=True,
-    )
-
-    best_genre, best_score = ranked[0]
-
-    # Generic electronic fallback.
-    if best_score < 2.0:
-        if bpm >= 160:
-            return "Drum & Bass"
-
-        if bpm >= 140:
-            return "Electronic"
-
-        if bpm >= 115:
-            return "Electronic"
-
-        if bpm >= 95:
-            return "Pop"
-
-        return "Downtempo"
-
-    return best_genre
 
 
 # ---------------------------------------------------------------------------
@@ -3706,44 +3175,50 @@ def analyze_file(filepath: str) -> dict:
         HOP_SIZE,
     )
 
-    # Dedicated beat-resolution STFT.
-    tempo_mag = _stft_magnitude(
-        y,
-        TEMPO_FRAME_SIZE,
-        TEMPO_HOP_SIZE,
-    )
+    # Prefer librosa's dynamic-programming beat tracker when available; it
+    # is considerably more robust than the hand-rolled autocorrelation
+    # fallback below. That fallback only runs if librosa isn't installed.
+    tempo = _estimate_tempo_librosa(y, ANALYSIS_SR)
 
-    # Kick: fundamental + low harmonics.
-    # This is the primary BPM signal.
-    kick_onset = _tempo_onset_envelope(
-        tempo_mag,
-        ANALYSIS_SR,
-        TEMPO_FRAME_SIZE,
-        40.0,
-        160.0,
-    )
+    if tempo is None:
+        # Dedicated beat-resolution STFT.
+        tempo_mag = _stft_magnitude(
+            y,
+            TEMPO_FRAME_SIZE,
+            TEMPO_HOP_SIZE,
+        )
 
-    # Snare/clap: higher-frequency transient information.
-    # Useful for confirming the beat and distinguishing subdivisions.
-    snare_onset = _tempo_onset_envelope(
-        tempo_mag,
-        ANALYSIS_SR,
-        TEMPO_FRAME_SIZE,
-        150.0,
-        4000.0,
-    )
+        # Kick: fundamental + low harmonics.
+        # This is the primary BPM signal.
+        kick_onset = _tempo_onset_envelope(
+            tempo_mag,
+            ANALYSIS_SR,
+            TEMPO_FRAME_SIZE,
+            40.0,
+            160.0,
+        )
 
-    # Kick dominates the BPM estimate.
-    beat_onset = _combine_beat_envelopes(
-        kick_onset,
-        snare_onset,
-    )
+        # Snare/clap: higher-frequency transient information.
+        # Useful for confirming the beat and distinguishing subdivisions.
+        snare_onset = _tempo_onset_envelope(
+            tempo_mag,
+            ANALYSIS_SR,
+            TEMPO_FRAME_SIZE,
+            150.0,
+            4000.0,
+        )
 
-    tempo = _estimate_tempo(
-        beat_onset,
-        ANALYSIS_SR,
-        TEMPO_HOP_SIZE,
-    )
+        # Kick dominates the BPM estimate.
+        beat_onset = _combine_beat_envelopes(
+            kick_onset,
+            snare_onset,
+        )
+
+        tempo = _estimate_tempo(
+            beat_onset,
+            ANALYSIS_SR,
+            TEMPO_HOP_SIZE,
+        )
 
     tempo = float(
         np.clip(
@@ -3762,17 +3237,22 @@ def analyze_file(filepath: str) -> dict:
     # Key
     # ------------------------------------------------------------------
 
-    key_mag = _stft_magnitude(
-        y,
-        KEY_FRAME_SIZE,
-        KEY_HOP_SIZE,
-    )
+    # Same idea as tempo: librosa's constant-Q chroma is a better basis for
+    # key detection than our plain-STFT chroma, when it's available.
+    key_name = _detect_key_librosa(y, ANALYSIS_SR)
 
-    key_name = _detect_key_from_stft(
-        key_mag,
-        ANALYSIS_SR,
-        KEY_FRAME_SIZE,
-    )
+    if key_name is None:
+        key_mag = _stft_magnitude(
+            y,
+            KEY_FRAME_SIZE,
+            KEY_HOP_SIZE,
+        )
+
+        key_name = _detect_key_from_stft(
+            key_mag,
+            ANALYSIS_SR,
+            KEY_FRAME_SIZE,
+        )
 
     camelot = key_to_camelot(
         key_name
@@ -3937,10 +3417,9 @@ def analyze_file(filepath: str) -> dict:
         "duration": float(
             full_duration
         ),
-        "tempo": round(
-            tempo,
-            1,
-        ),
+        # DJ-oriented BPM as a whole number; industry-standard displays
+        # (Rekordbox, Serato, etc.) essentially never show a decimal.
+        "tempo": round(tempo),
         "key_name": key_name,
         "camelot": camelot,
 

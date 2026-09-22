@@ -216,6 +216,30 @@ def filter_tracks(
 # Selection
 # ---------------------------------------------------------------------------
 
+FAVORITE_SELECTION_WEIGHT = 3.0  # how much more likely a hearted track is to be picked
+
+
+def _weighted_shuffle(candidates: List[Track]) -> List[Track]:
+    """Shuffle so favorited tracks tend to sort earlier (more likely to be selected).
+
+    Standard weighted-random-permutation trick: each item gets a key of
+    `random() ** (1 / weight)`, then sorting descending by key produces a
+    random order where higher-weight items are more likely to rank first,
+    while still allowing any track to land anywhere.
+    """
+    def weight(track: Track) -> float:
+        return FAVORITE_SELECTION_WEIGHT if getattr(track, "favorite", False) else 1.0
+
+    keyed = [
+        (random.random() ** (1.0 / weight(track)), track)
+        for track in candidates
+    ]
+
+    keyed.sort(key=lambda pair: pair[0], reverse=True)
+
+    return [track for _, track in keyed]
+
+
 def _select_for_duration(
     candidates: List[Track],
     target_seconds: float,
@@ -224,8 +248,7 @@ def _select_for_duration(
     if target_seconds <= 0:
         return list(candidates)
 
-    pool = list(candidates)
-    random.shuffle(pool)
+    pool = _weighted_shuffle(candidates)
 
     selected = []
     total = 0.0
@@ -263,12 +286,11 @@ def _select_by_count(
     candidates: List[Track],
     count: int,
 ) -> List[Track]:
-    """Randomly pick up to count tracks from filtered candidates."""
+    """Randomly pick up to count tracks from filtered candidates (favorites weighted higher)."""
     if count <= 0:
         return list(candidates)
 
-    pool = list(candidates)
-    random.shuffle(pool)
+    pool = _weighted_shuffle(candidates)
 
     return pool[:count]
 
@@ -540,12 +562,21 @@ def generate_playlist(
     energy_range=None,
     harmonic_mixing: bool = True,
     track_count: Optional[int] = None,
+    locked_tracks: Optional[List[Track]] = None,
 ) -> List[Track]:
     """Generate a playlist according to the requested mode.
+
+    `locked_tracks` (e.g. songs the user pinned/favorited in the builder) are
+    always kept in the result regardless of the genre/tempo/energy filters,
+    and count against the requested duration/track count. The ordering step
+    then places the rest of the playlist coherently around them.
 
     Tempo, energy and loudness are all considered during transition
     optimization. The public function signature is preserved.
     """
+    locked_tracks = list(locked_tracks or [])
+    locked_ids = {t.id for t in locked_tracks if t.id is not None}
+
     candidates = filter_tracks(
         library,
         genres,
@@ -553,13 +584,17 @@ def generate_playlist(
         energy_range,
     )
 
-    if not candidates:
+    # Locked tracks are supplied separately below, never duplicated here.
+    candidates = [t for t in candidates if t.id not in locked_ids]
+
+    if not candidates and not locked_tracks:
         return []
 
     if track_count:
+        remaining = max(0, track_count - len(locked_tracks))
         selected = _select_by_count(
             candidates,
-            track_count,
+            remaining,
         )
     else:
         target_seconds = (
@@ -568,13 +603,25 @@ def generate_playlist(
             else 0
         )
 
+        if target_seconds:
+            locked_seconds = sum(
+                float(getattr(t, "duration", 0.0)) or 0.0
+                for t in locked_tracks
+            )
+
+            remaining_seconds = max(0.0, target_seconds - locked_seconds)
+        else:
+            remaining_seconds = 0
+
         selected = _select_for_duration(
             candidates,
-            target_seconds,
+            remaining_seconds,
         )
 
-    if not selected:
+    if not selected and not locked_tracks:
         return []
+
+    selected = locked_tracks + selected
 
     # ------------------------------------------------------------------
     # Tempo progression

@@ -1,19 +1,7 @@
 
 
-- tempo should not be with float most of the time (maybe base on the most common tempo in industry and take closest or other method)
-    BEST SOLUTION: find a more elaborated library (IA?) to detect key and tempo
+- check metadata online (cover, artist, etc)
+- user can add spotify/soundcloud playlists
 - more theme (difference color than purple)
-- check metadata online
-- fix name (metadata) at exportation (copy) in folder
-- waveform viewer more definition and grid match peaks
-- in the playlist builder, the user can fix some song and hit generate so the new playlist generated will kept the checkd song (allow him to keep favorite one)
-- user can add heart to track (favorite), this heart appear next to the track in the playlist and library views
-- extend the style detection to more genre of musique, better detection algorithms
-- the user can also remove son from the library (but not from the disk)
-- BPM sorting is consider as text not as number
-- user can click where he want in the navigation/progress bar of the played song
-- allow to change column width in the playlist and library views
-- allow to click on album cover art in the player to see a larger view
-
 - .exe and macOS versions
 - README

@@ -3,3 +3,6 @@ numpy>=1.24
 miniaudio>=1.59
 mutagen>=1.47
 pyinstaller>=6.3
+# Optional: improves tempo/key detection accuracy (analyzer.py falls back
+# to a pure-numpy method automatically if this isn't installed).
+librosa>=0.10

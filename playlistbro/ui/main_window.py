@@ -110,7 +110,9 @@ class MainWindow(QMainWindow):
             self.library_view.waveform_dialog.apply_theme(palette["bg"], palette["accent_strong"])
         if self.playlist_builder.waveform_dialog:
             self.playlist_builder.waveform_dialog.apply_theme(palette["bg"], palette["accent_strong"])
-        self.player.apply_theme(palette["accent_strong"])
+        self.player.apply_theme(
+            palette["accent_strong"], palette["bg"], palette["accent_strong"], palette["accent"],
+        )
         if persist:
             self.settings["theme"] = mode
             save_settings(self.settings)

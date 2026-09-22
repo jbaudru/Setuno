@@ -53,6 +53,10 @@ class _CurveChart(QWidget):
         self.values = values
         self.update()
 
+    def set_color(self, color: str):
+        self.color = QColor(color)
+        self.update()
+
     def set_theme(self, bg: str, axis: str, title: str):
         self.bg_color = QColor(bg)
         self.axis_color = QColor(axis)
@@ -258,6 +262,8 @@ class StatsWidget(QWidget):
 
     def apply_theme(self, bg: str, axis: str, title: str, accent: str):
         self.tempo_chart.set_theme(bg, axis, title)
+        self.tempo_chart.set_color(accent)
         self.energy_chart.set_theme(bg, axis, title)
+        self.energy_chart.set_color(axis)
         self.genre_chart.set_theme(bg, title)
         self.summary_label.setStyleSheet(f"color: {accent}; font-weight: bold;")

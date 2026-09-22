@@ -49,8 +49,8 @@ PALETTES = {
         "surface": "#ffffff",
         "surface_alt": "#e8e8f5",
         "border": "#c3c3dd",
-        "accent": "#505081",
-        "accent_strong": "#8686AC",
+        "accent": "#1677FF",
+        "accent_strong": "#2F8BFF",
         "text": "#2c2c44",
         "muted_text": "#50506e",
         "icon": "#2c2c44",
@@ -62,34 +62,15 @@ PALETTES = {
     # ------------------------------------------------------------------
 
     "rekordbox": {
-    # Main application background.
     "bg": "#0D0E10",
-
-    # Main panels and widgets.
     "surface": "#151719",
-
-    # Slightly elevated panels / headers.
     "surface_alt": "#202225",
-
-    # Subtle separators and borders.
     "border": "#303236",
-
-    # Rekordbox 7 blue.
     "accent": "#1677FF",
-
-    # Active / hovered blue.
     "accent_strong": "#2F8BFF",
-
-    # Primary text.
     "text": "#E8E9EB",
-
-    # Secondary text.
     "muted_text": "#85888D",
-
-    # Icons.
     "icon": "#C8C9CC",
-
-    # Selected track / row.
     "selection": "#173A63",
     },
     

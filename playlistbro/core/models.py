@@ -23,6 +23,7 @@ class Track:
     added_at: str = ""
     tempo_manual: bool = False     # True once the user has manually corrected the BPM
     key_manual: bool = False       # True once the user has manually corrected the key
+    favorite: bool = False         # True once the user has hearted the track
     cover_path: str = ""           # cached embedded album-art file, empty if none
     waveform_low: list = field(default_factory=list)   # bass-band envelope, computed at scan time
     waveform_high: list = field(default_factory=list)  # treble-band envelope, computed at scan time

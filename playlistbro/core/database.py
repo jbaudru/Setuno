@@ -89,6 +89,7 @@ class Database:
             tempo_manual = bool(existing.get("tempo_manual")) if existing else False
             key_manual = bool(existing.get("key_manual")) if existing else False
             metadata_manual = bool(existing.get("metadata_manual")) if existing else False
+            favorite = bool(existing.get("favorite")) if existing else False
             if tempo_manual:
                 tempo = existing["tempo"]
             if key_manual:
@@ -104,18 +105,27 @@ class Database:
                 "key_name": key_name, "camelot": camelot, "energy_raw": t.energy_raw,
                 "energy": t.energy, "loudness": t.loudness, "filesize": t.filesize, "mtime": t.mtime, "added_at": added_at,
                 "tempo_manual": tempo_manual, "key_manual": key_manual, "metadata_manual": metadata_manual,
+                "favorite": favorite,
                 "cover_path": t.cover_path, "waveform_low": t.waveform_low, "waveform_high": t.waveform_high,
             }
             self._tracks[track_id] = record
             self._save_tracks()
             return track_id
 
+    def set_favorite(self, track_id: int, favorite: bool):
+        with self._lock:
+            record = self._tracks.get(track_id)
+            if not record:
+                return
+            record["favorite"] = bool(favorite)
+            self._save_tracks()
+
     def set_manual_tempo(self, track_id: int, bpm: float):
         with self._lock:
             record = self._tracks.get(track_id)
             if not record:
                 return
-            record["tempo"] = round(float(bpm), 1)
+            record["tempo"] = round(float(bpm))
             record["tempo_manual"] = True
             self._save_tracks()
 
@@ -140,6 +150,15 @@ class Database:
             record["album"] = album
             record["genre"] = genre
             record["metadata_manual"] = True
+            self._save_tracks()
+
+    def update_cover(self, track_id: int, cover_path: str):
+        """Update the cached cover thumbnail after a manual album-art edit."""
+        with self._lock:
+            record = self._tracks.get(track_id)
+            if not record:
+                return
+            record["cover_path"] = cover_path
             self._save_tracks()
 
     def get_all_tracks(self) -> List[Track]:
@@ -206,6 +225,7 @@ class Database:
             filesize=r.get("filesize") or 0, mtime=r.get("mtime") or 0.0,
             added_at=r.get("added_at") or "",
             tempo_manual=bool(r.get("tempo_manual")), key_manual=bool(r.get("key_manual")),
+            favorite=bool(r.get("favorite")),
             cover_path=r.get("cover_path") or "",
             waveform_low=r.get("waveform_low") or [], waveform_high=r.get("waveform_high") or [],
         )

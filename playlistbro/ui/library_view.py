@@ -17,8 +17,13 @@ from .icon_loader import icon, cover_pixmap
 from .track_edit import edit_bpm, edit_key, edit_metadata
 from .waveform_view import MiniWaveform, WaveformDialog
 
-COLUMNS = ["Title", "Artist", "Album", "Genre", "BPM", "Key", "Camelot", "Energy", "Duration", "Waveform"]
+COLUMNS = ["\u2665", "Title", "Artist", "Album", "Genre", "BPM", "Key", "Camelot", "Energy", "Duration", "Waveform"]
+FAV_COL = 0
+TITLE_COL = 1
+BPM_COL = 5
 WAVEFORM_COL = len(COLUMNS) - 1
+FAVORITE_COLOR = "#e0435c"
+UNFAVORITE_COLOR = "#6b6b85"
 
 class NumericTableWidgetItem(QTableWidgetItem):
     """QTableWidgetItem that sorts using its numeric UserRole value."""
@@ -136,8 +141,12 @@ class LibraryView(QWidget):
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setAlternatingRowColors(True)
         self.table.setSortingEnabled(True)
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        for col, width in enumerate([30, 220, 100, 100, 100, 60, 70, 60, 70, 100]):
+            self.table.setColumnWidth(col, width)
         self.table.doubleClicked.connect(self._play_selected)
+        self.table.cellClicked.connect(self._on_cell_clicked)
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._show_context_menu)
 
@@ -298,14 +307,18 @@ class LibraryView(QWidget):
         self.table.setRowCount(len(rows))
         for r, t in enumerate(rows):
             values = [
-                t.title, t.artist, t.album, t.genre, f"{t.tempo:.1f}", t.key_name,
+                "", t.title, t.artist, t.album, t.genre, f"{t.tempo:.0f}", t.key_name,
                 t.camelot, f"{t.energy:.1f}", t.duration_str, "",
             ]
             for c, val in enumerate(values):
                 if c == WAVEFORM_COL:
                     continue
 
-                if c == 4:  # BPM
+                if c == FAV_COL:
+                    item = QTableWidgetItem("\u2665" if t.favorite else "\u2661")
+                    item.setForeground(QBrush(QColor(FAVORITE_COLOR if t.favorite else UNFAVORITE_COLOR)))
+                    item.setTextAlignment(Qt.AlignCenter)
+                elif c == BPM_COL:
                     item = NumericTableWidgetItem(val)
                     item.setData(Qt.UserRole, float(t.tempo))
                 else:
@@ -313,7 +326,7 @@ class LibraryView(QWidget):
 
                 item.setData(1000, t.id)
 
-                if c == 0:
+                if c == TITLE_COL:
                     item.setIcon(cover_pixmap(t.cover_path, 24))
 
                 self.table.setItem(r, c, item)
@@ -400,6 +413,21 @@ class LibraryView(QWidget):
     def _play_selected(self):
         self.play_row(self.table.currentRow())
 
+    def _on_cell_clicked(self, row: int, col: int):
+        if col != FAV_COL:
+            return
+        item = self.table.item(row, FAV_COL)
+        if not item:
+            return
+        track_id = item.data(1000)
+        track = next((t for t in self.tracks if t.id == track_id), None)
+        if not track:
+            return
+        track.favorite = not track.favorite
+        self.db.set_favorite(track_id, track.favorite)
+        item.setText("\u2665" if track.favorite else "\u2661")
+        item.setForeground(QBrush(QColor(FAVORITE_COLOR if track.favorite else UNFAVORITE_COLOR)))
+
     def _show_waveform(self, track: Track):
         if self.waveform_dialog is None:
             self.waveform_dialog = WaveformDialog(self,
@@ -422,6 +450,8 @@ class LibraryView(QWidget):
         key_action = menu.addAction("Edit Key...")
         metadata_action = menu.addAction("Edit Metadata...")
         waveform_action = menu.addAction("Show Waveform...")
+        menu.addSeparator()
+        remove_action = menu.addAction("Remove from Library")
         chosen = menu.exec(self.table.viewport().mapToGlobal(pos))
         if chosen == bpm_action and edit_bpm(self, self.db, track):
             self.refresh_from_db()
@@ -431,6 +461,21 @@ class LibraryView(QWidget):
             self.refresh_from_db()
         elif chosen == waveform_action:
             self._show_waveform(track)
+        elif chosen == remove_action:
+            self._remove_track(track)
+
+    def _remove_track(self, track: Track):
+        answer = QMessageBox.question(
+            self, "Remove from Library",
+            f"Remove '{track.display_name}' from the library?\n\n"
+            "The file itself will not be deleted from disk.",
+        )
+        if answer != QMessageBox.Yes:
+            return
+        self.db.delete_track(track.id)
+        self.refresh_from_db()
+        if self.on_library_changed:
+            self.on_library_changed()
 
     def apply_theme(self, bg: str | None = None, bass: str | None = None, treble: str | None = None):
         """Refresh flat icons (colors are set globally in icon_loader before calling this)."""

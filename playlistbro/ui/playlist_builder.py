@@ -29,7 +29,7 @@ from PySide6.QtWidgets import (
 )
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QBrush, QColor, QFont
 
 from ..core.database import Database
 
@@ -54,6 +54,8 @@ from .waveform_view import MiniWaveform, WaveformDialog
 
 
 RESULT_COLUMNS = [
+    "Keep",
+    "\u2665",
     "#",
     "Title",
     "Artist",
@@ -65,7 +67,12 @@ RESULT_COLUMNS = [
     "Waveform",
 ]
 
+KEEP_COL = 0
+FAV_COL = 1
+TITLE_COL = 3
 WAVEFORM_COL = len(RESULT_COLUMNS) - 1
+FAVORITE_COLOR = "#e0435c"
+UNFAVORITE_COLOR = "#6b6b85"
 
 TEMPO_FIXED_TOLERANCE = 4.0  # +/- BPM window applied around a fixed tempo value
 ENERGY_FIXED_TOLERANCE = 1.0  # +/- window applied around a fixed energy value
@@ -113,6 +120,7 @@ class PlaylistBuilder(QWidget):
         self.folder_scan_worker: ScanWorker | None = None
         self.playing_track_id: int | None = None
         self.waveform_dialog: WaveformDialog | None = None
+        self._locked_ids: set[int] = set()  # track ids pinned ('Keep') across regenerations
 
         self._wave_bg = "#33334d"
         self._wave_bass = "#8686AC"
@@ -376,10 +384,15 @@ class PlaylistBuilder(QWidget):
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setAlternatingRowColors(True)
         self.table.horizontalHeader().setSectionResizeMode(
-            QHeaderView.Stretch
+            QHeaderView.Interactive
         )
-
+        self.table.horizontalHeader().setStretchLastSection(True)
+        for col, width in enumerate([40, 30, 40, 220, 100, 60, 100, 70, 70, 70]):
+            self.table.setColumnWidth(col, width)
+        
         self.table.doubleClicked.connect(self._play_selected)
+        self.table.itemChanged.connect(self._on_item_changed)
+        self.table.cellClicked.connect(self._on_cell_clicked)
 
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(
@@ -579,6 +592,7 @@ class PlaylistBuilder(QWidget):
         genre = self.genre_combo.currentData()
         genres = [genre] if genre else None
         by_count = self.length_mode_combo.currentData() == "count"
+        locked_tracks = [t for t in self.current_playlist if t.id in self._locked_ids]
         playlist = generate_playlist(
             library, mode, 0 if by_count else self.duration_spin.value(),
             genres=genres,
@@ -586,6 +600,7 @@ class PlaylistBuilder(QWidget):
             energy_range=self._energy_range(),
             harmonic_mixing=self.harmonic_check.isChecked(),
             track_count=self.count_spin.value() if by_count else None,
+            locked_tracks=locked_tracks,
         )
         self.current_playlist = playlist
         self._populate_table(playlist)
@@ -597,18 +612,32 @@ class PlaylistBuilder(QWidget):
             QMessageBox.information(self, "No matches", "No tracks match these filters.")
 
     def _populate_table(self, playlist):
+        self.table.blockSignals(True)
         self.table.setRowCount(len(playlist))
         for r, t in enumerate(playlist):
             values = [
-                str(r + 1), t.title, t.artist, f"{t.tempo:.1f}", t.key_name,
+                "", "", str(r + 1), t.title, t.artist, f"{t.tempo:.0f}", t.key_name,
                 t.camelot, f"{t.energy:.1f}", t.duration_str, "",
             ]
             for c, val in enumerate(values):
                 if c == WAVEFORM_COL:
                     continue
-                item = QTableWidgetItem(val)
+                if c == KEEP_COL:
+                    item = QTableWidgetItem()
+                    item.setFlags(
+                        (item.flags() | Qt.ItemIsUserCheckable) & ~Qt.ItemIsEditable
+                    )
+                    item.setCheckState(
+                        Qt.Checked if t.id in self._locked_ids else Qt.Unchecked
+                    )
+                elif c == FAV_COL:
+                    item = QTableWidgetItem("\u2665" if t.favorite else "\u2661")
+                    item.setForeground(QBrush(QColor(FAVORITE_COLOR if t.favorite else UNFAVORITE_COLOR)))
+                    item.setTextAlignment(Qt.AlignCenter)
+                else:
+                    item = QTableWidgetItem(val)
                 item.setData(1000, t.id)
-                if c == 1:
+                if c == TITLE_COL:
                     item.setIcon(cover_pixmap(t.cover_path, 24))
                 self.table.setItem(r, c, item)
             waveform = MiniWaveform(
@@ -616,7 +645,32 @@ class PlaylistBuilder(QWidget):
                 on_clicked=lambda track=t: self._show_waveform(track),
             )
             self.table.setCellWidget(r, WAVEFORM_COL, waveform)
+        self.table.blockSignals(False)
         self._apply_playing_marker()
+
+    def _on_item_changed(self, item):
+        """Track 'Keep' checkbox toggles so favorites survive the next Generate."""
+        if item.column() != KEEP_COL:
+            return
+        track_id = item.data(1000)
+        if track_id is None:
+            return
+        if item.checkState() == Qt.Checked:
+            self._locked_ids.add(track_id)
+        else:
+            self._locked_ids.discard(track_id)
+
+    def _on_cell_clicked(self, row: int, col: int):
+        if col != FAV_COL:
+            return
+        item = self.table.item(row, FAV_COL)
+        if not item or row >= len(self.current_playlist):
+            return
+        track = self.current_playlist[row]
+        track.favorite = not track.favorite
+        self.db.set_favorite(track.id, track.favorite)
+        item.setText("\u2665" if track.favorite else "\u2661")
+        item.setForeground(QBrush(QColor(FAVORITE_COLOR if track.favorite else UNFAVORITE_COLOR)))
 
     def get_row_ids(self) -> list[int]:
         """Track ids in the current on-screen row order."""
@@ -629,7 +683,7 @@ class PlaylistBuilder(QWidget):
 
     def _apply_playing_marker(self):
         """Bold the row of the currently playing track and prefix its title with ▶."""
-        title_col = 1
+        title_col = TITLE_COL
         for r in range(self.table.rowCount()):
             id_item = self.table.item(r, 0)
             title_item = self.table.item(r, title_col)
@@ -720,6 +774,8 @@ class PlaylistBuilder(QWidget):
         key_action = menu.addAction("Edit Key...")
         metadata_action = menu.addAction("Edit Metadata...")
         waveform_action = menu.addAction("Show Waveform...")
+        menu.addSeparator()
+        remove_action = menu.addAction("Remove from Library")
         chosen = menu.exec(self.table.viewport().mapToGlobal(pos))
         if chosen == bpm_action and edit_bpm(self, self.db, track):
             updated = self.db.get_track(track.id)
@@ -738,6 +794,24 @@ class PlaylistBuilder(QWidget):
                 self._populate_table(self.current_playlist)
         elif chosen == waveform_action:
             self._show_waveform(track)
+        elif chosen == remove_action:
+            self._remove_track(row, track)
+
+    def _remove_track(self, row: int, track):
+        answer = QMessageBox.question(
+            self, "Remove from Library",
+            f"Remove '{track.display_name}' from the library?\n\n"
+            "The file itself will not be deleted from disk.",
+        )
+        if answer != QMessageBox.Yes:
+            return
+        self.db.delete_track(track.id)
+        self._locked_ids.discard(track.id)
+        del self.current_playlist[row]
+        self._populate_table(self.current_playlist)
+        self.stats_widget.update_stats(self.current_playlist)
+        if self.on_library_changed:
+            self.on_library_changed()
 
     def _ensure_files_available(self) -> bool:
         """Offer to relocate any moved/renamed files before exporting. Returns False to abort."""
@@ -808,6 +882,7 @@ class PlaylistBuilder(QWidget):
         track_ids = record.get("track_ids", [])
         tracks = [self.db.get_track(tid) for tid in track_ids]
         tracks = [t for t in tracks if t]
+        self._locked_ids = set()  # a freshly-loaded playlist starts with no pins
         self.current_playlist = tracks
         self._populate_table(tracks)
         self.stats_widget.update_stats(tracks)

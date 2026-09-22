@@ -11,6 +11,27 @@ def _safe_name(name: str) -> str:
     return re.sub(r'[\\/:*?"<>|]', "_", name).strip()
 
 
+def _write_tags(dest: Path, track: Track):
+    """Best-effort sync of the copy's embedded tags with the track's current metadata."""
+    try:
+        from mutagen import File as MutagenFile
+
+        audio = MutagenFile(str(dest), easy=True)
+        if audio is None:
+            return
+        if track.title:
+            audio["title"] = track.title
+        if track.artist:
+            audio["artist"] = track.artist
+        if track.album:
+            audio["album"] = track.album
+        if track.genre:
+            audio["genre"] = track.genre
+        audio.save()
+    except Exception:
+        pass
+
+
 def export_m3u(tracks: List[Track], output_path: str, use_relative: bool = False):
     """Write an extended M3U playlist (.m3u or .m3u8) importable by Rekordbox and similar DJ software."""
     output_path = Path(output_path)
@@ -46,5 +67,6 @@ def export_ordered_copies(tracks: List[Track], target_folder: str) -> List[str]:
         dest_name = f"{str(i).zfill(width)} - {_safe_name(t.display_name)}{src.suffix}"
         dest = target / dest_name
         shutil.copy2(src, dest)
+        _write_tags(dest, t)
         results.append(str(dest))
     return results

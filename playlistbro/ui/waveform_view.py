@@ -1,10 +1,13 @@
 """Non-modal waveform preview, shown when a track is clicked in the Library or Playlist Builder."""
 
-from PySide6.QtCore import Qt, QThread, Signal
-from PySide6.QtGui import  QColor, QFont, QPainter, QPainterPath
+from PySide6.QtCore import Qt, QThread, QUrl, Signal
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPainterPath, QPen
+from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtWidgets import (
     QDialog,
+    QHBoxLayout,
     QLabel,
+    QPushButton,
     QSizePolicy,
     QVBoxLayout,
     QWidget,
@@ -12,6 +15,7 @@ from PySide6.QtWidgets import (
 
 from ..core.analyzer import compute_waveform_peaks
 from ..core.models import Track
+from .icon_loader import icon
 
 
 class MiniWaveform(QWidget):
@@ -227,6 +231,8 @@ class _WaveformWorker(QThread):
 class _WaveformChart(QWidget):
     """DJ-style waveform with zoom, pan, timecode and BPM grid."""
 
+    seek_requested = Signal(float)  # emitted with the clicked time (seconds)
+
     def __init__(self, bass_color: str, treble_color: str, bg_color: str, parent=None):
         super().__init__(parent)
 
@@ -234,6 +240,7 @@ class _WaveformChart(QWidget):
         self.bpm = None
         self.track_duration = None
         self.beat_offset = 0.0
+        self.playhead_time = None
 
         self.bass_color = QColor(bass_color)
         self.treble_color = QColor(treble_color)
@@ -244,6 +251,7 @@ class _WaveformChart(QWidget):
         self._dragging = False
         self._drag_start_x = 0.0
         self._drag_start_pan = 0.0
+        self._press_moved = False
 
         self.setMinimumHeight(160)
         self.setSizePolicy(
@@ -292,6 +300,14 @@ class _WaveformChart(QWidget):
             self.beat_offset = float(offset)
         except (TypeError, ValueError):
             self.beat_offset = 0.0
+        self.update()
+
+    def set_playhead(self, seconds):
+        """Show a playback-position marker, or hide it when `seconds` is None."""
+        try:
+            self.playhead_time = None if seconds is None else max(0.0, float(seconds))
+        except (TypeError, ValueError):
+            self.playhead_time = None
         self.update()
 
     def set_theme(self, bg, bass_color, treble_color):
@@ -477,10 +493,22 @@ class _WaveformChart(QWidget):
 
         font = QFont("Segoe UI", 8)
         painter.setFont(font)
+        fm = QFontMetrics(font)
 
-        current_beat = 0
+        # Pick a label stride (in beats, snapped to a power of two) so that
+        # consecutive timecodes stay at least a label-width apart no matter
+        # the zoom level: sparse when the whole track is visible, and
+        # progressively denser (down to one label per beat) while zooming in.
+        total_beats = max(1, last - first)
+        px_per_beat = max(0.01, self.width() / total_beats)
+        min_label_spacing = fm.horizontalAdvance("00:00") + 10
+
+        label_stride = 1
+        while px_per_beat * label_stride < min_label_spacing and label_stride < total_beats:
+            label_stride *= 2
+
         for beat in range(first, last + 1):
-            
+
             time = (
                 self.beat_offset
                 + beat * beat_length
@@ -512,8 +540,8 @@ class _WaveformChart(QWidget):
                 self.height(),
             )
 
-            # Time labels when zoomed or on bar lines.
-            if self.zoom_factor >= 10.0 or current_beat % 32 == 0:
+            # Timecode density adapts to the current zoom (see label_stride above).
+            if beat % label_stride == 0:
                 minutes = int(time // 60)
                 seconds = int(time % 60)
 
@@ -533,7 +561,6 @@ class _WaveformChart(QWidget):
                     14,
                     label,
                 )
-            current_beat += 1
         painter.restore()
 
     # ------------------------------------------------------------------
@@ -553,17 +580,18 @@ class _WaveformChart(QWidget):
         if len(values) < 2:
             return
 
-        # More detail as zoom increases.
+        # More detail as zoom increases (and a higher baseline than before
+        # so the fully-zoomed-out view keeps sharp peaks too).
         target = max(
-            256,
+            400,
             int(
                 self.width()
                 * (
-                    2.0
+                    3.0
                     + min(
                         self.zoom_factor,
                         32.0,
-                    ) * 0.75
+                    ) * 1.0
                 )
             ),
         )
@@ -647,6 +675,62 @@ class _WaveformChart(QWidget):
         painter.setBrush(Qt.NoBrush)
         painter.drawPath(path)
 
+    def _draw_playhead(self, painter):
+        """Draw a marker at the current playback position, if visible."""
+        if (
+            self.playhead_time is None
+            or not self.peaks
+            or not self.track_duration
+        ):
+            return
+
+        start, end = self._visible_range()
+
+        if end <= start:
+            return
+
+        start_time = self._sample_to_time(start)
+        end_time = self._sample_to_time(end - 1)
+
+        if self.playhead_time < start_time or self.playhead_time > end_time:
+            return
+
+        sample = self._time_to_sample(self.playhead_time)
+        x = self._sample_to_x(sample, start, end)
+
+        marker_color = QColor(255, 255, 255, 235)
+
+        pen = QPen(marker_color)
+        pen.setWidthF(2.0)
+        painter.setPen(pen)
+        painter.drawLine(int(x), 0, int(x), self.height())
+
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(marker_color)
+
+        handle = QPainterPath()
+        handle.moveTo(x - 5, 0)
+        handle.lineTo(x + 5, 0)
+        handle.lineTo(x, 7)
+        handle.closeSubpath()
+        painter.drawPath(handle)
+
+    def _emit_seek_at(self, x):
+        """Translate a click's x position into a track time and emit `seek_requested`."""
+        start, end = self._visible_range()
+
+        if end <= start:
+            return
+
+        visible = max(1, end - start - 1)
+        sample = start + (x / max(1, self.width())) * visible
+        time = self._sample_to_time(sample)
+
+        if self.track_duration:
+            time = max(0.0, min(self.track_duration, time))
+
+        self.seek_requested.emit(time)
+
     # ------------------------------------------------------------------
     # Paint
     # ------------------------------------------------------------------
@@ -692,6 +776,10 @@ class _WaveformChart(QWidget):
             )
 
             self._draw_waveform(
+                painter
+            )
+
+            self._draw_playhead(
                 painter
             )
 
@@ -782,19 +870,22 @@ class _WaveformChart(QWidget):
     def mousePressEvent(self, event):
         if (
             event.button() == Qt.LeftButton
-            and self.zoom_factor > 1.0
+            and self.peaks
         ):
-            self._dragging = True
-            self._drag_start_x = (
-                event.position().x()
-            )
-            self._drag_start_pan = (
-                self.pan_position
-            )
+            self._press_moved = False
 
-            self.setCursor(
-                Qt.ClosedHandCursor
-            )
+            if self.zoom_factor > 1.0:
+                self._dragging = True
+                self._drag_start_x = (
+                    event.position().x()
+                )
+                self._drag_start_pan = (
+                    self.pan_position
+                )
+
+                self.setCursor(
+                    Qt.ClosedHandCursor
+                )
 
             event.accept()
             return
@@ -811,6 +902,9 @@ class _WaveformChart(QWidget):
                 event.position().x()
                 - self._drag_start_x
             )
+
+            if abs(dx) > 3:
+                self._press_moved = True
 
             visible = (
                 1.0 / self.zoom_factor
@@ -841,8 +935,10 @@ class _WaveformChart(QWidget):
     def mouseReleaseEvent(self, event):
         if (
             event.button() == Qt.LeftButton
-            and self._dragging
+            and (self._dragging or self.peaks)
         ):
+            was_click = not self._press_moved
+
             self._dragging = False
 
             self.setCursor(
@@ -850,6 +946,11 @@ class _WaveformChart(QWidget):
                 if self.zoom_factor > 1.0
                 else Qt.ArrowCursor
             )
+
+            if was_click and self.peaks and self.track_duration:
+                self._emit_seek_at(
+                    event.position().x()
+                )
 
             event.accept()
             return
@@ -883,7 +984,12 @@ class _WaveformChart(QWidget):
 
 
 class WaveformDialog(QDialog):
-    """Reusable non-modal waveform preview."""
+    """Reusable non-modal waveform preview.
+
+    Clicking inside the chart seeks and plays a preview using its own
+    QMediaPlayer, independent from (and able to overlap with) the app's
+    main player.
+    """
 
     def __init__(
         self,
@@ -901,21 +1007,40 @@ class WaveformDialog(QDialog):
         self._current_filepath = ""
         self._active_workers = set()
 
+        self.preview_player = QMediaPlayer(self)
+        self.preview_audio = QAudioOutput(self)
+        self.preview_player.setAudioOutput(self.preview_audio)
+        self.preview_audio.setVolume(0.8)
+        self.preview_player.positionChanged.connect(self._on_preview_position)
+        self.preview_player.playbackStateChanged.connect(self._on_preview_state)
+
         self.title_label = QLabel("")
         self.title_label.setStyleSheet(
             "font-weight: bold;"
         )
+
+        self.preview_play_btn = QPushButton()
+        self.preview_play_btn.setIcon(icon("play"))
+        self.preview_play_btn.setFlat(True)
+        self.preview_play_btn.setFixedSize(28, 28)
+        self.preview_play_btn.setToolTip("Play/pause this preview (click the waveform to seek)")
+        self.preview_play_btn.clicked.connect(self._toggle_preview)
 
         self.chart = _WaveformChart(
             bg_color=bg_color,
             bass_color=bass_color,
             treble_color=treble_color,
         )
+        self.chart.seek_requested.connect(self._seek_preview)
+
+        header = QHBoxLayout()
+        header.addWidget(self.preview_play_btn)
+        header.addWidget(self.title_label, 1)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
-        layout.addWidget(self.title_label)
+        layout.addLayout(header)
         layout.addWidget(self.chart)
 
     @staticmethod
@@ -976,6 +1101,8 @@ class WaveformDialog(QDialog):
         return None
 
     def load_track(self, track):
+        self.preview_player.stop()
+        self.chart.set_playhead(None)
         self._current_filepath = track.filepath
 
         self.setWindowTitle(
@@ -1032,7 +1159,40 @@ class WaveformDialog(QDialog):
         if filepath == self._current_filepath:
             self.chart.set_peaks(peaks)
 
+    def _seek_preview(self, seconds: float):
+        if not self._current_filepath:
+            return
+        source = self.preview_player.source()
+        if source.isEmpty() or source.toLocalFile() != self._current_filepath:
+            self.preview_player.setSource(QUrl.fromLocalFile(self._current_filepath))
+        self.preview_player.setPosition(int(seconds * 1000))
+        self.preview_player.play()
+
+    def _toggle_preview(self):
+        if not self._current_filepath:
+            return
+        if self.preview_player.playbackState() == QMediaPlayer.PlayingState:
+            self.preview_player.pause()
+        else:
+            if self.preview_player.source().isEmpty():
+                self.preview_player.setSource(QUrl.fromLocalFile(self._current_filepath))
+            self.preview_player.play()
+
+    def _on_preview_position(self, pos_ms: int):
+        self.chart.set_playhead(pos_ms / 1000.0)
+
+    def _on_preview_state(self, state):
+        is_playing = state == QMediaPlayer.PlayingState
+        self.preview_play_btn.setIcon(icon("pause") if is_playing else icon("play"))
+
+    def closeEvent(self, event):
+        self.preview_player.stop()
+        super().closeEvent(event)
+
     def apply_theme(self, bg, color):
+        is_playing = self.preview_player.playbackState() == QMediaPlayer.PlayingState
+        self.preview_play_btn.setIcon(icon("pause") if is_playing else icon("play"))
+
         base = QColor(color)
 
         treble = QColor(base)
