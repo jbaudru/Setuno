@@ -1,83 +1,149 @@
-# Setuno
+<div align="center">
+  <img src="assets/icon.png" alt="Setuno icon" width="96" height="96" />
 
-A local, offline companion for **DJs, radio hosts, and playlist curators**. Scans a music
-folder (recursively), analyzes each track's **tempo (BPM)**, **musical key** (with Camelot
-wheel code for harmonic mixing), and **energy**, then generates ordered playlists for a
-target set length or track count, with an embedded player, live statistics, and export
-options. Modern dark/light UI.
+  # Setuno
+
+  **A local, offline companion for DJs, radio hosts, and playlist curators.**
+
+  [![Latest release](https://img.shields.io/github/v/release/jbaudru/Setuno)](https://github.com/jbaudru/Setuno/releases/latest)
+</div>
+
+Setuno scans a music folder (recursively), analyzes each track's **tempo (BPM)**, **musical
+key** (with Camelot wheel code for harmonic mixing), **energy**, and **genre**, then generates
+ordered playlists for a target set length or track count — with an embedded player, waveform
+view, live statistics, and export options. Everything runs locally and offline; your library
+never leaves your machine.
 
 Created by **J. Baudru (Bonoob)**.
+
+## Download
+
+Prebuilt, ready-to-run builds are published on the [Releases page](https://github.com/jbaudru/Setuno/releases/latest):
+
+| Platform | Download | Notes |
+| --- | --- | --- |
+| Windows | `Setuno-Setup-<version>.exe` | Installer (Start Menu + desktop shortcut) |
+| Windows | `Setuno.exe` | Portable, no installation needed |
+| macOS | `Setuno.dmg` | Open it and drag **Setuno** into **Applications** |
+
+No Python installation is required to use these builds. If your platform isn't listed, or you'd
+rather run the source directly, see [Running from source](#running-from-source) below.
 
 ## Features
 
 - Recursive folder scan (`mp3`, `wav`, `flac`, `ogg`), analyzed in parallel with a thread pool
-- Automatic metadata: tempo, key (Camelot code), energy (1-10 normalized), genre (from tags,
-  with a tempo-based fallback heuristic when no tag is present)
+- Automatic metadata: tempo, key (Camelot code), energy (1-10 normalized), and genre — classified
+  across 35+ styles from spectral/rhythmic descriptors, with `librosa`-backed tempo/key detection
+  when that optional dependency is installed
 - Tracks appear in the library live as each one finishes analyzing (no waiting for the full scan)
+- Favorites (heart a track) that are also weighted more likely to appear in generated playlists
 - Playlist generation modes:
   - **Fixed tempo** — consistent tempo band, ordered for harmonic (Camelot) compatibility
   - **Tempo progression** — build up (or down) tempo across the set
   - **Fixed energy** — consistent energy band
   - **Energy progression** — energy build across the set
-- Target set length (30 min, 1h, 2h, ...) with duration-aware track selection
+  - **Tempo + Energy progression** — combined build across the set
+- "Keep" checkboxes in the Playlist Builder to pin favorite tracks and regenerate the rest of
+  the set around them
+- Target set length (30 min, 1h, 2h, ...) or a fixed track count, with duration-aware selection
 - Filter by genre / tempo range / energy range
-- Embedded audio player (play/pause/seek/volume)
-- Live stats: tempo curve, energy curve, genre breakdown, totals
-- Export: save as `.m3u` / `.m3u8` (importable in Rekordbox and similar DJ software), or copy
-  files in playlist order into a folder with numeric prefixes (`01 - Artist - Title.mp3`, ...),
-  or save the playlist definition to the library
+- Embedded audio player with click-to-seek and an extendable waveform view showing live playback
+  progress
+- Per-track waveform viewer with zoom/pan, BPM grid, and independent preview playback (seek and
+  play a section without disturbing the main player)
+- Full metadata editor (title/artist/album/genre/cover art) from the Library or Playlist Builder
+- Live stats: tempo curve, energy curve, genre breakdown, totals — themed to match the active
+  color scheme
+- Export: save as `.m3u` / `.m3u8` (importable in Rekordbox and similar DJ software, with tags
+  synced on exported copies), copy files in playlist order into a folder with numeric prefixes
+  (`01 - Artist - Title.mp3`, ...), or save the playlist definition to the library
+- Remove tracks from the library without touching the files on disk
+- Multiple themes (dark, light, Rekordbox-style)
 - Local JSON library cache (no external database) — re-scanning only re-analyzes new/changed files
 
-## Dependencies
+## Running from source
 
-Kept intentionally minimal for a small, portable build:
+If you're not using one of the compiled builds above, Setuno runs anywhere Python 3.11+ and Qt
+are supported (Windows, macOS, Linux).
 
-- `PySide6` — UI, embedded player (QtMultimedia)
-- `numpy` — all tempo/key/energy DSP (STFT, onset detection, autocorrelation, chroma)
-- `miniaudio` — lightweight audio decoding (mp3/wav/flac/ogg), no scipy/numba/llvmlite
-- `mutagen` — tag reading
-
-No matplotlib, scipy, numba, or SQL database — stats are drawn with plain `QPainter`, and
-the library is plain JSON.
-
-## Setup
-
-```powershell
+```bash
+git clone https://github.com/jbaudru/Setuno.git
+cd Setuno
 python -m venv .venv
+
+# Windows
 .venv\Scripts\Activate.ps1
+# macOS / Linux
+source .venv/bin/activate
+
 pip install -r requirements.txt
 python main.py
 ```
 
-## Building a Windows .exe
+### Dependencies
+
+Kept intentionally minimal for a small, portable build:
+
+- `PySide6` — UI, embedded player (QtMultimedia)
+- `numpy` — tempo/key/energy DSP (STFT, onset detection, autocorrelation, chroma)
+- `miniaudio` — lightweight audio decoding (mp3/wav/flac/ogg)
+- `mutagen` — reading and writing tags/cover art
+- `librosa` *(optional)* — improves tempo and key detection accuracy when installed; Setuno
+  automatically falls back to its built-in numpy-only detector if it isn't present
+
+## Building the binaries yourself
+
+Both the Windows `.exe`/installer and the macOS `.app`/`.dmg` are produced from the same
+[`build.spec`](build.spec) PyInstaller spec, and are built automatically by the
+[`release` GitHub Actions workflow](.github/workflows/release.yml) whenever a `v*` tag is pushed
+(see the **Actions** tab for build artifacts, or the **Releases** page once published).
+
+To build locally instead:
+
+### Windows
 
 ```powershell
 pip install pyinstaller
 pyinstaller build.spec
+# -> dist\Setuno.exe (portable, single file)
 ```
 
-The executable is produced in `dist/Setuno.exe` (single file, no console window).
+Optionally wrap it in a proper installer with [Inno Setup](https://jrsoftware.org/isinfo.php):
 
-## Building on macOS (later)
+```powershell
+ISCC installer\setuno.iss
+# -> dist\installer\Setuno-Setup-<version>.exe
+```
 
-The codebase is pure Python/Qt (PySide6) with no Windows-specific APIs, so the same
-`pyinstaller build.spec` command works on macOS to produce a `.app` bundle — just run it
-from a Mac with the dependencies installed.
+### macOS
+
+```bash
+pip install pyinstaller
+bash scripts/make_icns.sh   # generates assets/icon.icns from icon.png (macOS only)
+pyinstaller build.spec
+# -> dist/Setuno.app
+```
+
+Package it as a `.dmg` for distribution:
+
+```bash
+hdiutil create -volname "Setuno" -srcfolder dist/Setuno.app -ov -format UDZO dist/Setuno.dmg
+```
 
 ## Notes
 
 - The library is stored as plain JSON files under `data/library.json` and `data/playlists.json`,
-  next to `main.py` (or next to `Setuno.exe` when built). No external database.
+  next to `main.py` (or next to the app executable when built). No external database.
 - Analysis of long tracks is capped to a ~90s representative window for speed; this keeps
   scanning fast while still giving reliable tempo/key/energy estimates.
-- Genre is read from existing ID3/Vorbis tags when present; otherwise a simple tempo-based
-  heuristic label is assigned (can be corrected by tagging files with a proper genre).
+- Genre is read from existing ID3/Vorbis tags when present; otherwise it's classified by a
+  nearest-profile match over BPM and spectral/rhythmic descriptors (see `GENRE_PROFILES` in
+  `playlistbro/core/analyzer.py`).
 
 ## Roadmap — ideas for later
 
 Useful DJ/radio/curator features not yet implemented, kept here as a backlog:
 
-- **Beat-grid & waveform view** — visual waveform with detected beat markers/downbeats for precise manual mixing cues.
 - **Cue points & hot cues** — save/recall intro, drop, and outro markers per track.
 - **Auto-crossfade preview** — simulate the transition between two tracks (tempo-matched crossfade) directly in the embedded player.
 - **Key-lock / pitch preview** — preview a track at an adjusted BPM without changing pitch.
@@ -85,10 +151,9 @@ Useful DJ/radio/curator features not yet implemented, kept here as a backlog:
 - **Vocal/instrumental detection** — tag tracks as vocal, instrumental, or acapella for smarter mixing.
 - **Smart re-shuffle** — regenerate just a portion of a playlist (e.g. the last 10 tracks) without rebuilding the whole set.
 - **Set history / play log** — track what was actually played (and when) across gigs, for reporting or PRO/royalty logging (useful for radio).
-- **Tag editor** — edit title/artist/genre/BPM/key directly from the library table and write changes back to file tags.
 - **Streaming service import** — import a Spotify/SoundCloud/Bandcamp playlist as a reference to match against the local library.
-- **BPM/key manual override & confidence score** — let the user correct auto-detected values, and show a confidence indicator for low-certainty detections.
+- **Confidence score** — show a confidence indicator alongside auto-detected BPM/key for low-certainty tracks.
 - **Multiple output profiles** — export presets per target software (Rekordbox, Serato, Traktor, generic M3U) with their specific quirks/metadata.
 - **Energy curve templates** — named curve presets (e.g. "warm-up", "peak-time", "afters") that drive the energy-progression generator automatically.
-- **Multi-folder libraries** — manage several independent watched folders/crates instead of one flat library.
 - **Cloud/network drive support** — tolerate slow or intermittently available paths (NAS, external drives) without blocking scans.
+
