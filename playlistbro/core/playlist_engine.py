@@ -21,12 +21,18 @@ MODE_ENERGY_PROGRESSION = "energy_progression"
 
 MODE_COMBINED_PROGRESSION = "tempo_energy_progression"
 
+MODE_SONG_SIMILARITY = "song_similarity"
+
+MODE_CUSTOM_PROFILE = "custom_profile"
+
 ALL_MODES = [
     MODE_FIXED_TEMPO,
     MODE_TEMPO_PROGRESSION,
     MODE_FIXED_ENERGY,
     MODE_ENERGY_PROGRESSION,
     MODE_COMBINED_PROGRESSION,
+    MODE_SONG_SIMILARITY,
+    MODE_CUSTOM_PROFILE,
 ]
 
 MODE_LABELS = {
@@ -35,6 +41,8 @@ MODE_LABELS = {
     MODE_FIXED_ENERGY: "Fixed energy",
     MODE_ENERGY_PROGRESSION: "Energy progression",
     MODE_COMBINED_PROGRESSION: "Tempo + Energy progression",
+    MODE_SONG_SIMILARITY: "Song similarity",
+    MODE_CUSTOM_PROFILE: "Custom",
 }
 
 
@@ -71,6 +79,39 @@ def _track_energy(track: Track) -> float:
         return 0.0
 
 
+def _descriptor_distance(current: Track, candidate: Track) -> float:
+    """Compare all stored spectral and rhythmic analysis descriptors.
+
+    Old tracks without descriptor data receive no penalty until a rescan stores it.
+    """
+    current_features = {
+        **(getattr(current, "spectral_features", None) or {}),
+        **(getattr(current, "rhythmic_features", None) or {}),
+    }
+    candidate_features = {
+        **(getattr(candidate, "spectral_features", None) or {}),
+        **(getattr(candidate, "rhythmic_features", None) or {}),
+    }
+    keys = current_features.keys() & candidate_features.keys()
+    if not keys:
+        return 0.0
+    scales = {
+        "spectral_centroid": 5000.0, "spectral_rolloff": 8000.0,
+        "spectral_flatness": 1.0, "bass_ratio": 1.0, "low_mid_ratio": 1.0,
+        "mid_ratio": 1.0, "high_ratio": 1.0, "brightness": 1.0,
+        "harmonicity": 1.0, "onset_density": 1.0,
+        "onset_variability": 3.0, "rhythmic_regularity": 1.0,
+    }
+    distances = []
+    for key in keys:
+        try:
+            scale = scales.get(key, 1.0)
+            distances.append(min(1.0, abs(float(current_features[key]) - float(candidate_features[key])) / scale))
+        except (TypeError, ValueError):
+            continue
+    return sum(distances) / len(distances) if distances else 0.0
+
+
 def _normalize_values(values: List[float]) -> List[float]:
     """Normalize a list to 0-1."""
     if not values:
@@ -96,6 +137,11 @@ def _musical_distance(
     energy_weight: float = 1.0,
     loudness_weight: float = 1.0,
     harmonic_weight: float = 3.0,
+    genre_weight: float = 0.75,
+    duration_weight: float = 0.25,
+    album_weight: float = 0.35,
+    filesize_weight: float = 0.15,
+    descriptor_weight: float = 2.5,
 ) -> float:
     """Calculate a multi-dimensional transition distance.
 
@@ -138,12 +184,80 @@ def _musical_distance(
         candidate.camelot,
     )
 
+    current_genre = (getattr(current, "genre", "") or "").strip().casefold()
+    candidate_genre = (getattr(candidate, "genre", "") or "").strip().casefold()
+    genre_distance = 0.0 if current_genre and current_genre == candidate_genre else 1.0
+    current_duration = max(1.0, float(getattr(current, "duration", 0.0) or 0.0))
+    candidate_duration = max(1.0, float(getattr(candidate, "duration", 0.0) or 0.0))
+    duration_distance = abs(candidate_duration - current_duration) / max(current_duration, candidate_duration)
+    current_album = (getattr(current, "album", "") or "").strip().casefold()
+    candidate_album = (getattr(candidate, "album", "") or "").strip().casefold()
+    album_distance = 0.0 if current_album and current_album == candidate_album else 1.0
+    current_size = max(1.0, float(getattr(current, "filesize", 0) or 0))
+    candidate_size = max(1.0, float(getattr(candidate, "filesize", 0) or 0))
+    filesize_distance = abs(candidate_size - current_size) / max(current_size, candidate_size)
+    descriptor_distance = _descriptor_distance(current, candidate)
+
     return (
         tempo_weight * tempo_distance
         + energy_weight * energy_distance
         + loudness_weight * loudness_distance
         + harmonic_weight * harmonic_distance
+        + genre_weight * genre_distance
+        + duration_weight * duration_distance
+        + album_weight * album_distance
+        + filesize_weight * filesize_distance
+        + descriptor_weight * descriptor_distance
     )
+
+
+def track_similarity(first: Track, second: Track) -> float:
+    """Return a 0-100 similarity score using the track analysis features."""
+    distance = _musical_distance(first, second)
+    return max(0.0, min(100.0, 100.0 * (1.0 - distance / 8.0)))
+
+
+def _similarity_order(tracks: List[Track]) -> List[Track]:
+    """Create a nearest-neighbor sequence using all transition features."""
+    if not tracks:
+        return []
+    remaining = list(tracks)
+    current = remaining.pop(0)
+    ordered = [current]
+    while remaining:
+        current = min(remaining, key=lambda candidate: _musical_distance(current, candidate))
+        remaining.remove(current)
+        ordered.append(current)
+    return ordered
+
+
+def _profile_order(tracks: List[Track], profile: dict, tempo_range, energy_range) -> List[Track]:
+    """Match each playlist position to the user-drawn tempo and energy targets."""
+    if not tracks:
+        return []
+    tempo_curve = profile.get("tempo", [0.5])
+    energy_curve = profile.get("energy", [0.5])
+    tempo_min, tempo_max = tempo_range or (0.0, 300.0)
+    energy_min, energy_max = energy_range or (0.0, 10.0)
+    tempo_span = max(1.0, tempo_max - tempo_min)
+    energy_span = max(1.0, energy_max - energy_min)
+    remaining = list(tracks)
+    ordered = []
+    for index in range(len(tracks)):
+        ratio = index / max(1, len(tracks) - 1)
+        curve_index = min(len(tempo_curve) - 1, round(ratio * (len(tempo_curve) - 1)))
+        target_tempo = tempo_min + float(tempo_curve[curve_index]) * tempo_span
+        target_energy = energy_min + float(energy_curve[min(len(energy_curve) - 1, curve_index)]) * energy_span
+        current = min(
+            remaining,
+            key=lambda track: (
+                abs(float(getattr(track, "tempo", 0.0)) - target_tempo) / tempo_span
+                + abs(_track_energy(track) - target_energy) / energy_span
+            ),
+        )
+        remaining.remove(current)
+        ordered.append(current)
+    return ordered
 
 
 # ---------------------------------------------------------------------------
@@ -563,6 +677,7 @@ def generate_playlist(
     harmonic_mixing: bool = True,
     track_count: Optional[int] = None,
     locked_tracks: Optional[List[Track]] = None,
+    custom_profile: Optional[dict] = None,
 ) -> List[Track]:
     """Generate a playlist according to the requested mode.
 
@@ -660,6 +775,12 @@ def generate_playlist(
             selected,
             ascending=True,
         )
+
+    if mode == MODE_SONG_SIMILARITY:
+        return _similarity_order(selected)
+
+    if mode == MODE_CUSTOM_PROFILE:
+        return _profile_order(selected, custom_profile or {}, tempo_range, energy_range)
 
     # ------------------------------------------------------------------
     # Fixed energy

@@ -75,6 +75,9 @@ def cover_pixmap(cover_path: str, size: int = 32) -> QPixmap:
     if cover_path:
         pixmap = QPixmap(cover_path)
         if not pixmap.isNull():
-            return pixmap.scaled(size, size, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+            scaled = pixmap.scaled(size, size, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
+            x = max(0, (scaled.width() - size) // 2)
+            y = max(0, (scaled.height() - size) // 2)
+            return scaled.copy(x, y, size, size)
     return _cover_placeholder(size)
 

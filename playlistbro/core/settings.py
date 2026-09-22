@@ -4,7 +4,10 @@ from pathlib import Path
 
 from .database import default_data_dir
 
-_DEFAULTS = {"theme": "dark", "library_folders": []}
+_DEFAULTS = {
+    "theme": "dark", "library_folders": [],
+    "library_visible_columns": None,
+}
 
 
 def _settings_path() -> Path:

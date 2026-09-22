@@ -61,7 +61,10 @@ class Database:
 
     def _save_tracks(self):
         tmp = self.tracks_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(list(self._tracks.values()), indent=2), encoding="utf-8")
+        tmp.write_text(
+            json.dumps(list(self._tracks.values()), separators=(",", ":")),
+            encoding="utf-8",
+        )
         tmp.replace(self.tracks_path)
 
     def _save_playlists(self):
@@ -107,6 +110,8 @@ class Database:
                 "tempo_manual": tempo_manual, "key_manual": key_manual, "metadata_manual": metadata_manual,
                 "favorite": favorite,
                 "cover_path": t.cover_path, "waveform_low": t.waveform_low, "waveform_high": t.waveform_high,
+                "waveform_peaks": t.waveform_peaks,
+                "spectral_features": t.spectral_features, "rhythmic_features": t.rhythmic_features,
             }
             self._tracks[track_id] = record
             self._save_tracks()
@@ -196,10 +201,21 @@ class Database:
             self._save_tracks()
 
     def delete_track(self, track_id: int):
+        self.delete_tracks([track_id])
+
+    def delete_tracks(self, track_ids) -> int:
+        """Delete multiple tracks with one persistence write."""
         with self._lock:
-            if track_id in self._tracks:
+            ids = set(track_ids)
+            removed = 0
+            for track_id in ids:
+                if track_id not in self._tracks:
+                    continue
                 del self._tracks[track_id]
+                removed += 1
+            if removed:
                 self._save_tracks()
+            return removed
 
     def update_filepath(self, track_id: int, new_filepath: str):
         """Point an existing track at a new location on disk (e.g. after a relocate)."""
@@ -228,6 +244,9 @@ class Database:
             favorite=bool(r.get("favorite")),
             cover_path=r.get("cover_path") or "",
             waveform_low=r.get("waveform_low") or [], waveform_high=r.get("waveform_high") or [],
+            waveform_peaks=r.get("waveform_peaks") or [],
+            spectral_features=r.get("spectral_features") or {},
+            rhythmic_features=r.get("rhythmic_features") or {},
         )
 
     # ---------------- playlists ----------------

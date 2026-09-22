@@ -3395,6 +3395,7 @@ def analyze_file(filepath: str) -> dict:
             ANALYSIS_SR,
         )
     )
+    waveform_peaks = compute_waveform_peaks(filepath)
 
     cover_path = _extract_cover(
         filepath
@@ -3439,6 +3440,9 @@ def analyze_file(filepath: str) -> dict:
 
         "waveform_low": waveform_low,
         "waveform_high": waveform_high,
+        "waveform_peaks": waveform_peaks,
+        "spectral_features": spectral,
+        "rhythmic_features": rhythmic,
 
         "filesize": st.st_size,
         "mtime": st.st_mtime,

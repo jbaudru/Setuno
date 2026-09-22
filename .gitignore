@@ -2,7 +2,8 @@
 __pycache__/
 *.pyc
 build/
-dist/
+dist/*
+!dist/Setuno.exe
 *.spec.bak
 
 # Virtual environments
@@ -20,3 +21,5 @@ data/covers/
 .vscode/
 .DS_Store
 Thumbs.db
+dist/Setuno.exe
+dist/Setuno.exe

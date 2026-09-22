@@ -27,6 +27,9 @@ class Track:
     cover_path: str = ""           # cached embedded album-art file, empty if none
     waveform_low: list = field(default_factory=list)   # bass-band envelope, computed at scan time
     waveform_high: list = field(default_factory=list)  # treble-band envelope, computed at scan time
+    waveform_peaks: list = field(default_factory=list)  # full-track envelope shared by mini/full waveform views
+    spectral_features: dict = field(default_factory=dict)  # analyzed spectral descriptors for similarity matching
+    rhythmic_features: dict = field(default_factory=dict)  # analyzed rhythmic descriptors for similarity matching
 
     @property
     def display_name(self) -> str:

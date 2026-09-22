@@ -38,6 +38,8 @@ PALETTES = {
         "muted_text": "#d8d8ec",
         "icon": "#ffffff",
         "selection": "#8686AC",
+        "badge": "#9a9ac2",
+        "badge_text": "#33334d",
     },
 
     # ------------------------------------------------------------------
@@ -55,6 +57,8 @@ PALETTES = {
         "muted_text": "#50506e",
         "icon": "#2c2c44",
         "selection": "#8686AC",
+        "badge": "#1677FF",
+        "badge_text": "#ffffff",
     },
 
     # ------------------------------------------------------------------
@@ -72,6 +76,23 @@ PALETTES = {
     "muted_text": "#85888D",
     "icon": "#C8C9CC",
     "selection": "#173A63",
+    "badge": "#2F8BFF",
+    "badge_text": "#ffffff",
+    },
+
+    "calm": {
+        "bg": "#0d1821",
+        "surface": "#344966",
+        "surface_alt": "#263b53",
+        "border": "#b4cded",
+        "accent": "#bfcc94",
+        "accent_strong": "#b4cded",
+        "text": "#f0f4ef",
+        "muted_text": "#b4cded",
+        "icon": "#f0f4ef",
+        "selection": "#344966",
+        "badge": "#bfcc94",
+        "badge_text": "#0d1821",
     },
     
     
@@ -147,6 +168,37 @@ QTabBar::tab:selected {{
     background: {p['accent']};
     color: #ffffff;
     border-color: {p['accent']};
+}}
+
+QPushButton#queueTabButton {{
+    background: {p['surface']};
+    color: {p['muted_text']};
+    padding: 7px 30px 7px 14px;
+    border: 1px solid {p['border']};
+    border-top-left-radius: 6px;
+    border-top-right-radius: 6px;
+    border-bottom-left-radius: 0;
+    border-bottom-right-radius: 0;
+}}
+
+QPushButton#queueTabButton:hover {{
+    background: {p['surface_alt']};
+    color: {p['text']};
+}}
+
+QPushButton#queueTabButton:checked {{
+    background: {p['accent']};
+    color: #ffffff;
+    border-color: {p['accent']};
+}}
+
+QLabel#queueBadge {{
+    background: {p['badge']};
+    color: {p['badge_text']};
+    border: none;
+    border-radius: 9px;
+    font-size: 10px;
+    font-weight: bold;
 }}
 
 

@@ -40,14 +40,16 @@ from ..core.playlist_engine import (
     ALL_MODES,
     MODE_FIXED_TEMPO,
     MODE_FIXED_ENERGY,
+    MODE_CUSTOM_PROFILE,
     generate_playlist,
 )
 
 from ..core.relocator import find_missing, relocate_tracks
-from ..core.scanner import is_within_folder
+from ..core.scanner import is_readable_file, is_within_folder
 
 from .icon_loader import icon, cover_pixmap
 from .library_view import ScanWorker
+from .profile_editor import ProfileEditorDialog
 from .stats_widget import StatsWidget
 from .track_edit import edit_bpm, edit_key, edit_metadata
 from .waveform_view import MiniWaveform, WaveformDialog
@@ -73,6 +75,8 @@ TITLE_COL = 3
 WAVEFORM_COL = len(RESULT_COLUMNS) - 1
 FAVORITE_COLOR = "#e0435c"
 UNFAVORITE_COLOR = "#6b6b85"
+UNAVAILABLE_COLOR = "#e06c48"
+PLAYED_COLOR = "#38a169"
 
 TEMPO_FIXED_TOLERANCE = 4.0  # +/- BPM window applied around a fixed tempo value
 ENERGY_FIXED_TOLERANCE = 1.0  # +/- window applied around a fixed energy value
@@ -91,13 +95,31 @@ class _ReorderableTable(QTableWidget):
         self.setAcceptDrops(True)
         self.setDropIndicatorShown(True)
         self.setDefaultDropAction(Qt.MoveAction)
-        self.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.setDragDropOverwriteMode(False)
+        self.setSelectionMode(QAbstractItemView.ExtendedSelection)
 
     def dropEvent(self, event):
-        super().dropEvent(event)
-
-        if self._on_reordered:
-            self._on_reordered()
+        selected_rows = sorted({index.row() for index in self.selectionModel().selectedRows()})
+        track_ids = [
+            self.item(row, KEEP_COL).data(1000)
+            for row in selected_rows
+            if self.item(row, KEEP_COL)
+        ]
+        position = event.position().toPoint()
+        target_index = self.indexAt(position)
+        target_row = target_index.row()
+        if target_row < 0:
+            target_row = self.rowCount()
+        elif position.y() > self.visualRect(target_index).center().y():
+            target_row += 1
+        if track_ids and self._on_reordered:
+            self._on_reordered(track_ids, target_row)
+            # The callback rebuilt the complete table. Report CopyAction so Qt's
+            # internal-move cleanup does not delete the newly populated source cells.
+            event.setDropAction(Qt.CopyAction)
+            event.accept()
+        else:
+            event.ignore()
 
 
 class PlaylistBuilder(QWidget):
@@ -107,6 +129,8 @@ class PlaylistBuilder(QWidget):
         db: Database,
         on_play_track=None,
         on_library_changed=None,
+        on_queue_track=None,
+        is_track_played=None,
         parent=None,
     ):
         super().__init__(parent)
@@ -114,6 +138,8 @@ class PlaylistBuilder(QWidget):
         self.db = db
         self.on_play_track = on_play_track
         self.on_library_changed = on_library_changed
+        self.on_queue_track = on_queue_track
+        self.is_track_played = is_track_played or (lambda _track_id: False)
 
         self.current_playlist = []
         self.folder_filter: str | None = None
@@ -121,10 +147,13 @@ class PlaylistBuilder(QWidget):
         self.playing_track_id: int | None = None
         self.waveform_dialog: WaveformDialog | None = None
         self._locked_ids: set[int] = set()  # track ids pinned ('Keep') across regenerations
+        self.custom_profile = {"tempo": [0.5] * 24, "energy": [0.5] * 24}
+        self._previous_mode_index = 0
 
         self._wave_bg = "#33334d"
         self._wave_bass = "#8686AC"
         self._wave_treble = "#d8d8ec"
+        self._profile_text = "#d8d8ec"
 
         # ---------------------------------------------------------
         # Folder filter
@@ -171,9 +200,7 @@ class PlaylistBuilder(QWidget):
         for m in ALL_MODES:
             self.mode_combo.addItem(MODE_LABELS[m], m)
 
-        self.mode_combo.currentIndexChanged.connect(
-            self._update_field_modes
-        )
+        self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
 
         # ---------------------------------------------------------
         # Tempo
@@ -264,6 +291,10 @@ class PlaylistBuilder(QWidget):
         self.generate_btn.setObjectName("generateButton")
         self.generate_btn.clicked.connect(self.generate)
 
+        self.edit_profile_btn = QPushButton("Edit profile...")
+        self.edit_profile_btn.clicked.connect(self._edit_custom_profile)
+        self.edit_profile_btn.setVisible(False)
+
         # ---------------------------------------------------------
         # Playlist parameters layout
         # ---------------------------------------------------------
@@ -346,6 +377,7 @@ class PlaylistBuilder(QWidget):
         options_layout.setSpacing(12)
 
         options_layout.addWidget(self.harmonic_check)
+        options_layout.addWidget(self.edit_profile_btn)
         options_layout.addStretch()
 
         self.generate_btn.setMinimumHeight(32)
@@ -519,6 +551,34 @@ class PlaylistBuilder(QWidget):
         by_count = self.length_mode_combo.currentData() == "count"
         self.duration_spin.setVisible(not by_count)
         self.count_spin.setVisible(by_count)
+        self.edit_profile_btn.setVisible(mode == MODE_CUSTOM_PROFILE)
+
+    def _on_mode_changed(self, index: int):
+        mode = self.mode_combo.itemData(index)
+        self._update_field_modes()
+        if mode == MODE_CUSTOM_PROFILE:
+            if not self._edit_custom_profile():
+                self.mode_combo.blockSignals(True)
+                self.mode_combo.setCurrentIndex(self._previous_mode_index)
+                self.mode_combo.blockSignals(False)
+                self._update_field_modes()
+                return
+        self._previous_mode_index = self.mode_combo.currentIndex()
+
+    def _edit_custom_profile(self) -> bool:
+        by_count = self.length_mode_combo.currentData() == "count"
+        target = (
+            f"{self.count_spin.value()} tracks"
+            if by_count else f"{self.duration_spin.value()} minutes"
+        )
+        dialog = ProfileEditorDialog(
+            target, self.custom_profile, self._tempo_range(), self._energy_range(),
+            self._wave_bg, self._profile_text, self,
+        )
+        if dialog.exec():
+            self.custom_profile = dialog.profile()
+            return True
+        return False
 
     def _tempo_range(self):
         if self.mode_combo.currentData() == MODE_FIXED_TEMPO:
@@ -601,6 +661,7 @@ class PlaylistBuilder(QWidget):
             harmonic_mixing=self.harmonic_check.isChecked(),
             track_count=self.count_spin.value() if by_count else None,
             locked_tracks=locked_tracks,
+            custom_profile=self.custom_profile if mode == MODE_CUSTOM_PROFILE else None,
         )
         self.current_playlist = playlist
         self._populate_table(playlist)
@@ -639,9 +700,13 @@ class PlaylistBuilder(QWidget):
                 item.setData(1000, t.id)
                 if c == TITLE_COL:
                     item.setIcon(cover_pixmap(t.cover_path, 24))
+                    if self.is_track_played(t.id):
+                        item.setForeground(QBrush(QColor(PLAYED_COLOR)))
+                    elif not is_readable_file(t.filepath):
+                        item.setForeground(QBrush(QColor(UNAVAILABLE_COLOR)))
                 self.table.setItem(r, c, item)
             waveform = MiniWaveform(
-                t.waveform_low, t.waveform_high, self._wave_bass, self._wave_treble, self._wave_bg,
+                t.waveform_peaks or t.waveform_low, self._wave_bass, self._wave_treble, self._wave_bg,
                 on_clicked=lambda track=t: self._show_waveform(track),
             )
             self.table.setCellWidget(r, WAVEFORM_COL, waveform)
@@ -703,23 +768,41 @@ class PlaylistBuilder(QWidget):
         self.playing_track_id = track_id
         self._apply_playing_marker()
 
-    def _on_table_reordered(self):
-        """Re-sync `current_playlist` order after the user drags a row to a new position."""
+    def refresh_played_state(self):
+        for row in range(self.table.rowCount()):
+            id_item = self.table.item(row, KEEP_COL)
+            title_item = self.table.item(row, TITLE_COL)
+            if not id_item or not title_item:
+                continue
+            track_id = id_item.data(1000)
+            track = next((item for item in self.current_playlist if item.id == track_id), None)
+            if self.is_track_played(track_id):
+                title_item.setForeground(QBrush(QColor(PLAYED_COLOR)))
+            elif track and not is_readable_file(track.filepath):
+                title_item.setForeground(QBrush(QColor(UNAVAILABLE_COLOR)))
+            else:
+                title_item.setForeground(QBrush())
+
+    def _on_table_reordered(self, track_ids: list[int], target_row: int):
+        """Insert the dragged rows at the requested position without Qt deleting cells."""
         id_to_track = {t.id: t for t in self.current_playlist}
-        new_order = []
-        for r in range(self.table.rowCount()):
-            item = self.table.item(r, 0)
-            tid = item.data(1000) if item else None
-            track = id_to_track.get(tid)
-            if track:
-                new_order.append(track)
-        if len(new_order) != len(self.current_playlist):
-            return  # drop didn't produce a clean 1:1 row mapping; leave state untouched
-        self.current_playlist = new_order
-        for r in range(self.table.rowCount()):
-            item = self.table.item(r, 0)
-            if item:
-                item.setText(str(r + 1))
+        moving_tracks = [id_to_track[track_id] for track_id in track_ids if track_id in id_to_track]
+        if not moving_tracks:
+            return
+        original_rows = {
+            self.table.item(row, KEEP_COL).data(1000): row
+            for row in range(self.table.rowCount())
+            if self.table.item(row, KEEP_COL)
+        }
+        insert_at = target_row - sum(
+            1 for track_id in track_ids if original_rows.get(track_id, -1) < target_row
+        )
+        remaining_tracks = [track for track in self.current_playlist if track.id not in track_ids]
+        insert_at = max(0, min(insert_at, len(remaining_tracks)))
+        self.current_playlist = (
+            remaining_tracks[:insert_at] + moving_tracks + remaining_tracks[insert_at:]
+        )
+        self._populate_table(self.current_playlist)
         self.stats_widget.update_stats(self.current_playlist)
 
     def play_row(self, row: int):
@@ -768,12 +851,18 @@ class PlaylistBuilder(QWidget):
         row = self.table.rowAt(pos.y())
         if row < 0 or row >= len(self.current_playlist):
             return
+        if not self.table.selectionModel().isRowSelected(row, self.table.rootIndex()):
+            self.table.selectRow(row)
         track = self.current_playlist[row]
+        selected_rows = sorted(index.row() for index in self.table.selectionModel().selectedRows())
         menu = QMenu(self)
         bpm_action = menu.addAction("Edit BPM...")
         key_action = menu.addAction("Edit Key...")
         metadata_action = menu.addAction("Edit Metadata...")
         waveform_action = menu.addAction("Show Waveform...")
+        queue_action = menu.addAction(
+            "Add Selected to Queue" if len(selected_rows) > 1 else "Add to Queue"
+        )
         menu.addSeparator()
         remove_action = menu.addAction("Remove from Library")
         chosen = menu.exec(self.table.viewport().mapToGlobal(pos))
@@ -794,20 +883,42 @@ class PlaylistBuilder(QWidget):
                 self._populate_table(self.current_playlist)
         elif chosen == waveform_action:
             self._show_waveform(track)
+        elif chosen == queue_action and self.on_queue_track:
+            id_to_track = {item.id: item for item in self.current_playlist}
+            selected_tracks = []
+            for selected_row in selected_rows:
+                selected_item = self.table.item(selected_row, KEEP_COL)
+                selected_track = id_to_track.get(selected_item.data(1000)) if selected_item else None
+                if selected_track:
+                    selected_tracks.append(selected_track)
+            self.on_queue_track(selected_tracks)
         elif chosen == remove_action:
-            self._remove_track(row, track)
+            selected_ids = {
+                self.table.item(selected_row.row(), KEEP_COL).data(1000)
+                for selected_row in self.table.selectionModel().selectedRows()
+                if self.table.item(selected_row.row(), KEEP_COL)
+            }
+            self._remove_tracks([t for t in self.current_playlist if t.id in selected_ids])
 
     def _remove_track(self, row: int, track):
+        self._remove_tracks([track])
+
+    def _remove_tracks(self, tracks):
+        if not tracks:
+            return
+        count = len(tracks)
+        names = f"{count} tracks" if count > 1 else f"'{tracks[0].display_name}'"
         answer = QMessageBox.question(
             self, "Remove from Library",
-            f"Remove '{track.display_name}' from the library?\n\n"
+            f"Remove {names} from the library?\n\n"
             "The file itself will not be deleted from disk.",
         )
         if answer != QMessageBox.Yes:
             return
-        self.db.delete_track(track.id)
-        self._locked_ids.discard(track.id)
-        del self.current_playlist[row]
+        track_ids = {track.id for track in tracks}
+        self.db.delete_tracks(track_ids)
+        self._locked_ids.difference_update(track_ids)
+        self.current_playlist = [track for track in self.current_playlist if track.id not in track_ids]
         self._populate_table(self.current_playlist)
         self.stats_widget.update_stats(self.current_playlist)
         if self.on_library_changed:
@@ -872,6 +983,7 @@ class PlaylistBuilder(QWidget):
             "tempo_range": list(self._tempo_range()),
             "energy_range": list(self._energy_range()),
             "harmonic_mixing": self.harmonic_check.isChecked(),
+            "custom_profile": self.custom_profile if mode == MODE_CUSTOM_PROFILE else None,
         }
         ids = [t.id for t in self.current_playlist]
         self.db.save_playlist(name.strip(), mode, params, ids)
@@ -887,11 +999,16 @@ class PlaylistBuilder(QWidget):
         self._populate_table(tracks)
         self.stats_widget.update_stats(tracks)
 
+        params = record.get("params", {})
+        if params.get("custom_profile"):
+            self.custom_profile = params["custom_profile"]
         idx = self.mode_combo.findData(record.get("mode"))
         if idx >= 0:
+            self.mode_combo.blockSignals(True)
             self.mode_combo.setCurrentIndex(idx)
-
-        params = record.get("params", {})
+            self.mode_combo.blockSignals(False)
+            self._previous_mode_index = idx
+            self._update_field_modes()
         by_count = params.get("length_mode") == "count" and params.get("track_count")
         length_idx = self.length_mode_combo.findData("count" if by_count else "duration")
         if length_idx >= 0:
@@ -924,6 +1041,8 @@ class PlaylistBuilder(QWidget):
         self.save_library_btn.setIcon(icon("star"))
         if bg and bass and treble:
             self._wave_bg, self._wave_bass, self._wave_treble = bg, bass, treble
+            color = QColor(bg)
+            self._profile_text = "#2c2c44" if color.lightness() > 140 else "#d8d8ec"
             for r in range(self.table.rowCount()):
                 widget = self.table.cellWidget(r, WAVEFORM_COL)
                 if isinstance(widget, MiniWaveform):

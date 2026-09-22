@@ -9,6 +9,15 @@ from .database import Database
 from .models import Track
 
 
+def is_readable_file(filepath: str) -> bool:
+    """Whether a stored track path is still a readable regular file."""
+    try:
+        path = Path(filepath)
+        return path.is_file() and os.access(path, os.R_OK)
+    except OSError:
+        return False
+
+
 def find_audio_files(root_folder: str):
     for dirpath, _dirnames, filenames in os.walk(root_folder):
         for name in filenames:
@@ -58,14 +67,17 @@ def scan_folder(
             if progress_cb:
                 progress_cb(done, total, Path(filepath).name)
             continue
-        to_analyze.append(filepath)
+        to_analyze.append((filepath, filepath not in existing))
 
     workers = max_workers or min(8, (os.cpu_count() or 4))
     if to_analyze:
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="analyze") as pool:
-            futures = {pool.submit(analyze_file, fp): fp for fp in to_analyze}
+            futures = {
+                pool.submit(analyze_file, filepath): (filepath, is_new)
+                for filepath, is_new in to_analyze
+            }
             for future in as_completed(futures):
-                filepath = futures[future]
+                filepath, is_new = futures[future]
                 if should_cancel and should_cancel():
                     for f in futures:
                         f.cancel()
@@ -73,6 +85,14 @@ def scan_folder(
                 done += 1
                 try:
                     data = future.result()
+                    if is_new and (
+                        not data.get("artist")
+                        or not data.get("album")
+                        or not data.get("genre")
+                        or not data.get("cover_path")
+                    ):
+                        from .metadata_lookup import enrich_metadata
+                        data = enrich_metadata(data)
                     track_id = db.upsert_track(Track(**data))
                     db.normalize_energy()
                     if track_cb:

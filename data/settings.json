@@ -1,5 +1,5 @@
 {
-  "theme": "rekordbox",
+  "theme": "light",
   "library_folders": [
     "D:\\\\Music\\\\PLAYLIST",
     "D:/Music/PLAYLIST/HARD TECHNO GYM",
@@ -13,6 +13,22 @@
     "D:/Music/PLAYLIST/DEEP",
     "D:/Music/PLAYLIST/DNB - TECH",
     "D:/Music/PLAYLIST/LIQUID - JUNGLE - BREAKCORE",
-    "D:/Music/PLAYLIST/RAP & HOUSE REMIX"
+    "D:/Music/PLAYLIST/RAP & HOUSE REMIX",
+    "C:/Users/julie/Music/Playlist/dnb",
+    "C:/Users/julie/Music/Playlist/Zara House",
+    "C:/Users/julie/Music/Playlist"
+  ],
+  "library_visible_columns": [
+    "\u2665",
+    "Title",
+    "Artist",
+    "Album",
+    "Genre",
+    "BPM",
+    "Key",
+    "Camelot",
+    "Energy",
+    "Duration",
+    "Waveform"
   ]
 }

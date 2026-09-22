@@ -7,23 +7,25 @@ from PySide6.QtGui import QBrush, QColor
 from PySide6.QtWidgets import (
     QAbstractItemView, QComboBox, QDialog, QFileDialog, QHBoxLayout, QHeaderView, QLabel,
     QLineEdit, QListWidget, QMenu, QMessageBox, QProgressBar, QPushButton, QTableWidget,
-    QTableWidgetItem, QVBoxLayout, QWidget,
+    QTableWidgetItem, QToolButton, QVBoxLayout, QWidget,
 )
 
 from ..core.database import Database
-from ..core.scanner import scan_folder, is_within_folder
+from ..core.scanner import is_readable_file, scan_folder, is_within_folder
 from ..core.models import Track
 from .icon_loader import icon, cover_pixmap
 from .track_edit import edit_bpm, edit_key, edit_metadata
 from .waveform_view import MiniWaveform, WaveformDialog
 
-COLUMNS = ["\u2665", "Title", "Artist", "Album", "Genre", "BPM", "Key", "Camelot", "Energy", "Duration", "Waveform"]
+COLUMNS = ["\u2665", "Title", "Artist", "Album", "Genre", "BPM", "Key", "Camelot", "Energy", "Duration", "Added", "Duplicates", "Waveform"]
 FAV_COL = 0
 TITLE_COL = 1
 BPM_COL = 5
 WAVEFORM_COL = len(COLUMNS) - 1
 FAVORITE_COLOR = "#e0435c"
 UNFAVORITE_COLOR = "#6b6b85"
+UNAVAILABLE_COLOR = "#e06c48"
+PLAYED_COLOR = "#38a169"
 
 class NumericTableWidgetItem(QTableWidgetItem):
     """QTableWidgetItem that sorts using its numeric UserRole value."""
@@ -94,7 +96,8 @@ class ScanWorker(QThread):
 class LibraryView(QWidget):
     def __init__(
         self, db: Database, on_library_changed=None, on_play_track=None,
-        get_library_folders=None, set_library_folders=None, parent=None,
+        get_library_folders=None, set_library_folders=None, on_queue_track=None,
+        is_track_played=None, get_visible_columns=None, set_visible_columns=None, parent=None,
     ):
         super().__init__(parent)
         self.db = db
@@ -102,7 +105,12 @@ class LibraryView(QWidget):
         self.on_play_track = on_play_track
         self.get_library_folders = get_library_folders or (lambda: [])
         self.set_library_folders = set_library_folders or (lambda folders: None)
+        self.on_queue_track = on_queue_track
+        self.is_track_played = is_track_played or (lambda _track_id: False)
+        self.get_visible_columns = get_visible_columns or (lambda: None)
+        self.set_visible_columns = set_visible_columns or (lambda _columns: None)
         self.tracks: list[Track] = []
+        self._search_cache: dict[int, str] = {}
         self.worker: ScanWorker | None = None
         self._refresh_pending = False
         self._pending_folder: str | None = None
@@ -118,13 +126,38 @@ class LibraryView(QWidget):
         self.stop_btn = QPushButton(" Stop")
         self.stop_btn.setIcon(icon("stop"))
         self.stop_btn.setEnabled(False)
+        self.stop_btn.setVisible(False)
         self.manage_folders_btn = QPushButton(" Manage Folders...")
         self.manage_folders_btn.setIcon(icon("folder"))
         self.folder_combo = QComboBox()
         self.folder_combo.addItem("All folders", None)
         self.search_edit = QLineEdit()
-        self.search_edit.setPlaceholderText("Search title / artist / genre...")
+        self.search_edit.setPlaceholderText("Search library...")
+        self.search_edit.setClearButtonEnabled(True)
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(180)
+        self._search_timer.timeout.connect(self.refresh_table)
         self.status_label = QLabel("")
+        self.columns_btn = QToolButton()
+        self.columns_btn.setIcon(icon("columns"))
+        self.columns_btn.setToolTip("Choose visible columns")
+        self.columns_btn.setAutoRaise(True)
+        self.columns_btn.setPopupMode(QToolButton.InstantPopup)
+        self.columns_btn.setStyleSheet("QToolButton::menu-indicator { image: none; width: 0px; }")
+        columns_menu = QMenu(self.columns_btn)
+        saved_columns = self.get_visible_columns()
+        visible_columns = set(saved_columns) if saved_columns else set(COLUMNS)
+        self._column_actions = []
+        for column, name in enumerate(COLUMNS):
+            label = "Favorite" if column == FAV_COL else name
+            action = columns_menu.addAction(label)
+            action.setCheckable(True)
+            action.setChecked(name in visible_columns or column == TITLE_COL)
+            action.setEnabled(column != TITLE_COL)
+            action.toggled.connect(lambda visible, column=column: self._set_column_visible(column, visible))
+            self._column_actions.append(action)
+        self.columns_btn.setMenu(columns_menu)
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
 
@@ -139,12 +172,15 @@ class LibraryView(QWidget):
         self.table.setHorizontalHeaderLabels(COLUMNS)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.table.setAlternatingRowColors(True)
         self.table.setSortingEnabled(True)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.table.horizontalHeader().setStretchLastSection(True)
-        for col, width in enumerate([30, 220, 100, 100, 100, 60, 70, 60, 70, 100]):
+        for col, width in enumerate([30, 220, 100, 100, 100, 60, 70, 70, 70, 100, 145, 75]):
             self.table.setColumnWidth(col, width)
+        for column, action in enumerate(self._column_actions):
+            self.table.setColumnHidden(column, not action.isChecked())
         self.table.doubleClicked.connect(self._play_selected)
         self.table.cellClicked.connect(self._on_cell_clicked)
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -153,14 +189,18 @@ class LibraryView(QWidget):
         layout = QVBoxLayout(self)
         layout.addLayout(top)
         layout.addWidget(self.progress_bar)
-        layout.addWidget(self.status_label)
+        status_row = QHBoxLayout()
+        status_row.addWidget(self.status_label)
+        status_row.addWidget(self.columns_btn)
+        status_row.addStretch(1)
+        layout.addLayout(status_row)
         layout.addWidget(self.table)
 
         self.scan_btn.clicked.connect(self.choose_folder)
         self.stop_btn.clicked.connect(self.stop_scan)
         self.manage_folders_btn.clicked.connect(self.manage_folders)
         self.folder_combo.currentIndexChanged.connect(self.refresh_table)
-        self.search_edit.textChanged.connect(self.refresh_table)
+        self.search_edit.textChanged.connect(lambda _text: self._search_timer.start())
 
         self._refresh_folder_combo(self.get_library_folders())
         self.refresh_from_db()
@@ -177,6 +217,7 @@ class LibraryView(QWidget):
         self.progress_bar.setValue(0)
         self.scan_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
+        self.stop_btn.setVisible(True)
         self.worker = ScanWorker(folder, self.db, force=force)
         self.worker.progress.connect(self._on_progress)
         self.worker.track_ready.connect(self._on_track_ready)
@@ -244,6 +285,12 @@ class LibraryView(QWidget):
             self.stop_btn.setEnabled(False)
             self.status_label.setText("Stopping...")
 
+    def _set_column_visible(self, column: int, visible: bool):
+        self.table.setColumnHidden(column, not visible)
+        self.set_visible_columns([
+            COLUMNS[index] for index, action in enumerate(self._column_actions) if action.isChecked()
+        ])
+
     def _on_progress(self, done, total, name):
         if total:
             self.progress_bar.setMaximum(total)
@@ -280,6 +327,7 @@ class LibraryView(QWidget):
         self.progress_bar.setVisible(False)
         self.scan_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
+        self.stop_btn.setVisible(False)
         self.status_label.setText("Scan complete.")
         if self._pending_folder:
             self._register_scanned_folder(self._pending_folder)
@@ -290,25 +338,35 @@ class LibraryView(QWidget):
 
     def refresh_from_db(self):
         self.tracks = self.db.get_all_tracks()
+        self._search_cache = {
+            track.id: " ".join((
+                track.title, track.artist, track.album, track.genre, track.key_name,
+                track.camelot, f"{track.tempo:.0f}", track.filepath,
+            )).casefold()
+            for track in self.tracks
+        }
         self.refresh_table()
 
     def refresh_table(self):
-        query = self.search_edit.text().strip().lower()
+        query = self.search_edit.text().strip().casefold()
         folder_filter = self.folder_combo.currentData()
         rows = self.tracks
         if folder_filter:
             rows = [t for t in rows if is_within_folder(t.filepath, folder_filter)]
         if query:
-            rows = [
-                t for t in rows
-                if query in t.title.lower() or query in t.artist.lower() or query in t.genre.lower()
-            ]
+            rows = [t for t in rows if query in self._search_cache.get(t.id, "")]
+        duplicate_counts = {}
+        for track in self.tracks:
+            key = (track.artist.strip().casefold(), track.title.strip().casefold())
+            if any(key):
+                duplicate_counts[key] = duplicate_counts.get(key, 0) + 1
         self.table.setSortingEnabled(False)
         self.table.setRowCount(len(rows))
         for r, t in enumerate(rows):
             values = [
                 "", t.title, t.artist, t.album, t.genre, f"{t.tempo:.0f}", t.key_name,
-                t.camelot, f"{t.energy:.1f}", t.duration_str, "",
+                t.camelot, f"{t.energy:.1f}", t.duration_str, (t.added_at or "")[:19].replace("T", " "),
+                str(duplicate_counts.get((t.artist.strip().casefold(), t.title.strip().casefold()), 0) or ""), "",
             ]
             for c, val in enumerate(values):
                 if c == WAVEFORM_COL:
@@ -324,17 +382,24 @@ class LibraryView(QWidget):
                 else:
                     item = QTableWidgetItem(val)
 
+                if c == WAVEFORM_COL - 1 and val:
+                    item.setToolTip(f"{val} files match this artist and title")
+
                 item.setData(1000, t.id)
 
                 if c == TITLE_COL:
                     item.setIcon(cover_pixmap(t.cover_path, 24))
+                    if self.is_track_played(t.id):
+                        item.setForeground(QBrush(QColor(PLAYED_COLOR)))
+                    elif not is_readable_file(t.filepath):
+                        item.setForeground(QBrush(QColor(UNAVAILABLE_COLOR)))
 
                 self.table.setItem(r, c, item)
             id_item = QTableWidgetItem("")
             id_item.setData(1000, t.id)
             self.table.setItem(r, WAVEFORM_COL, id_item)
             waveform = MiniWaveform(
-                t.waveform_low, t.waveform_high, self._wave_bass, self._wave_treble, self._wave_bg,
+                t.waveform_peaks or t.waveform_low, self._wave_bass, self._wave_treble, self._wave_bg,
                 on_clicked=lambda track=t: self._show_waveform(track),
             )
             self.table.setCellWidget(r, WAVEFORM_COL, waveform)
@@ -372,6 +437,21 @@ class LibraryView(QWidget):
     def set_playing_id(self, track_id: int | None):
         self.playing_track_id = track_id
         self._apply_playing_marker()
+
+    def refresh_played_state(self):
+        tracks = {track.id: track for track in self.tracks}
+        for row in range(self.table.rowCount()):
+            id_item = self.table.item(row, FAV_COL)
+            title_item = self.table.item(row, TITLE_COL)
+            if not id_item or not title_item:
+                continue
+            track = tracks.get(id_item.data(1000))
+            if self.is_track_played(id_item.data(1000)):
+                title_item.setForeground(QBrush(QColor(PLAYED_COLOR)))
+            elif track and not is_readable_file(track.filepath):
+                title_item.setForeground(QBrush(QColor(UNAVAILABLE_COLOR)))
+            else:
+                title_item.setForeground(QBrush())
 
     def play_row(self, row: int):
         if row < 0 or row >= self.table.rowCount() or not self.on_play_track:
@@ -441,15 +521,21 @@ class LibraryView(QWidget):
         row = self.table.rowAt(pos.y())
         if row < 0:
             return
+        if not self.table.selectionModel().isRowSelected(row, self.table.rootIndex()):
+            self.table.selectRow(row)
         item = self.table.item(row, 0)
         track = self.db.get_track(item.data(1000)) if item else None
         if not track:
             return
+        selected_rows = sorted(index.row() for index in self.table.selectionModel().selectedRows())
         menu = QMenu(self)
         bpm_action = menu.addAction("Edit BPM...")
         key_action = menu.addAction("Edit Key...")
         metadata_action = menu.addAction("Edit Metadata...")
         waveform_action = menu.addAction("Show Waveform...")
+        queue_action = menu.addAction(
+            "Add Selected to Queue" if len(selected_rows) > 1 else "Add to Queue"
+        )
         menu.addSeparator()
         remove_action = menu.addAction("Remove from Library")
         chosen = menu.exec(self.table.viewport().mapToGlobal(pos))
@@ -461,27 +547,49 @@ class LibraryView(QWidget):
             self.refresh_from_db()
         elif chosen == waveform_action:
             self._show_waveform(track)
+        elif chosen == queue_action and self.on_queue_track:
+            selected_tracks = []
+            for selected_row in selected_rows:
+                selected_item = self.table.item(selected_row, FAV_COL)
+                selected_track = self.db.get_track(selected_item.data(1000)) if selected_item else None
+                if selected_track:
+                    selected_tracks.append(selected_track)
+            self.on_queue_track(selected_tracks)
         elif chosen == remove_action:
-            self._remove_track(track)
+            selected_ids = {
+                self.table.item(selected_row.row(), FAV_COL).data(1000)
+                for selected_row in self.table.selectionModel().selectedRows()
+                if self.table.item(selected_row.row(), FAV_COL)
+            }
+            self._remove_tracks([t for t in self.tracks if t.id in selected_ids])
 
     def _remove_track(self, track: Track):
+        self._remove_tracks([track])
+
+    def _remove_tracks(self, tracks: list[Track]):
+        if not tracks:
+            return
+        count = len(tracks)
+        names = f"{count} tracks" if count > 1 else f"'{tracks[0].display_name}'"
         answer = QMessageBox.question(
             self, "Remove from Library",
-            f"Remove '{track.display_name}' from the library?\n\n"
+            f"Remove {names} from the library?\n\n"
             "The file itself will not be deleted from disk.",
         )
         if answer != QMessageBox.Yes:
             return
-        self.db.delete_track(track.id)
-        self.refresh_from_db()
+        self.db.delete_tracks(track.id for track in tracks)
         if self.on_library_changed:
             self.on_library_changed()
+        else:
+            self.refresh_from_db()
 
     def apply_theme(self, bg: str | None = None, bass: str | None = None, treble: str | None = None):
         """Refresh flat icons (colors are set globally in icon_loader before calling this)."""
         self.scan_btn.setIcon(icon("folder"))
         self.stop_btn.setIcon(icon("stop"))
         self.manage_folders_btn.setIcon(icon("folder"))
+        self.columns_btn.setIcon(icon("columns"))
         if bg and bass and treble:
             self._wave_bg, self._wave_bass, self._wave_treble = bg, bass, treble
             for r in range(self.table.rowCount()):

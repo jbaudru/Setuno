@@ -1,7 +1,4 @@
-
-
-- check metadata online (cover, artist, etc)
-- user can add spotify/soundcloud playlists
-- more theme (difference color than purple)
+- screen shot (theme, graph) 
+- fix the drag and drop action in the playlist builder
 - .exe and macOS versions
-- README
+- README add screenshot of graph view

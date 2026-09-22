@@ -23,8 +23,7 @@ class MiniWaveform(QWidget):
 
     def __init__(
         self,
-        low: list,
-        high: list,
+        peaks: list,
         bass_color: str,
         treble_color: str,
         bg_color: str,
@@ -33,8 +32,7 @@ class MiniWaveform(QWidget):
     ):
         super().__init__(parent)
 
-        self.low = low or []
-        self.high = high or []
+        self.peaks = peaks or []
 
         self.bass_color = QColor(bass_color)
         self.treble_color = QColor(treble_color)
@@ -155,15 +153,20 @@ class MiniWaveform(QWidget):
             QPainter.SmoothPixmapTransform
         )
 
-        if not self.low and not self.high:
+        if not self.peaks:
             return
 
         w = float(self.width())
         h = float(self.height())
         center = h / 2.0
 
-        low = self._normalize(self.low)
-        high = self._normalize(self.high)
+        values = self._normalize(self.peaks)
+        smooth = [
+            sum(values[max(0, i - 1):min(len(values), i + 2)]) / min(len(values), i + 2 - max(0, i - 1))
+            for i in range(len(values))
+        ]
+        low = smooth
+        high = [min(1.0, value * 0.48 + abs(raw - value) * 2.6) for raw, value in zip(values, smooth)]
 
         self._draw_waveform(
             painter,
@@ -1130,7 +1133,14 @@ class WaveformDialog(QDialog):
             beat_offset
         )
 
-        self.chart.set_peaks([])
+        self.chart.set_peaks(getattr(track, "waveform_peaks", []))
+
+        if self.chart.peaks:
+            if not self.isVisible():
+                self.show()
+            self.raise_()
+            self.activateWindow()
+            return
 
         worker = _WaveformWorker(
             track.filepath

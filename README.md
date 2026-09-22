@@ -10,7 +10,7 @@
 
 Setuno scans a music folder (recursively), analyzes each track's **tempo (BPM)**, **musical
 key** (with Camelot wheel code for harmonic mixing), **energy**, and **genre**, then generates
-ordered playlists for a target set length or track count — with an embedded player, waveform
+ordered playlists for a target set length or track count, with an embedded player, waveform
 view, live statistics, and export options. Everything runs locally and offline; your library
 never leaves your machine.
 
@@ -29,37 +29,78 @@ Prebuilt, ready-to-run builds are published on the [Releases page](https://githu
 No Python installation is required to use these builds. If your platform isn't listed, or you'd
 rather run the source directly, see [Running from source](#running-from-source) below.
 
+## Screenshots
+
+### Library
+
+Browse the analyzed library, search/filter folders, spot duplicates, and open compact waveforms.
+
+![Setuno library view](assets/screenshots/library-view.png)
+
+### Extended Library
+
+Use the embedded player and expanded waveform while browsing your tracks.
+
+![Setuno extended library view](assets/screenshots/library-view-extended.png)
+
+### Playlist Builder
+
+Generate a set by duration or track count, then fine-tune filters, order, and output options.
+
+![Setuno playlist builder](assets/screenshots/playlist-builder.png)
+
+### Playlist Analytics
+
+Inspect tempo and energy curves, genre distribution, and playlist totals.
+
+![Setuno playlist analytics](assets/screenshots/playlist-builder-stats.png)
+
+### Saved Playlists
+
+Reopen or remove saved playlist definitions from the library.
+
+![Setuno saved playlists](assets/screenshots/playlist-view.png)
+
+### Themes
+
+Choose from Setuno's dark presentation or the Rekordbox-inspired color scheme.
+
+![Setuno dark theme](assets/screenshots/theme-setuno.png)
+
+![Setuno Rekordbox theme](assets/screenshots/theme-rekordbox.png)
+
 ## Features
 
 - Recursive folder scan (`mp3`, `wav`, `flac`, `ogg`), analyzed in parallel with a thread pool
-- Automatic metadata: tempo, key (Camelot code), energy (1-10 normalized), and genre — classified
+- Automatic metadata: tempo, key (Camelot code), energy (1-10 normalized), and genre, classified
   across 35+ styles from spectral/rhythmic descriptors, with `librosa`-backed tempo/key detection
   when that optional dependency is installed
 - Tracks appear in the library live as each one finishes analyzing (no waiting for the full scan)
 - Favorites (heart a track) that are also weighted more likely to appear in generated playlists
 - Playlist generation modes:
-  - **Fixed tempo** — consistent tempo band, ordered for harmonic (Camelot) compatibility
-  - **Tempo progression** — build up (or down) tempo across the set
-  - **Fixed energy** — consistent energy band
-  - **Energy progression** — energy build across the set
-  - **Tempo + Energy progression** — combined build across the set
+  - **Fixed tempo**: consistent tempo band, ordered for harmonic (Camelot) compatibility
+  - **Tempo progression**: build up (or down) tempo across the set
+  - **Fixed energy**: consistent energy band
+  - **Energy progression**: energy build across the set
+  - **Tempo + Energy progression**: combined build across the set
 - "Keep" checkboxes in the Playlist Builder to pin favorite tracks and regenerate the rest of
   the set around them
 - Target set length (30 min, 1h, 2h, ...) or a fixed track count, with duration-aware selection
 - Filter by genre / tempo range / energy range
 - Embedded audio player with click-to-seek and an extendable waveform view showing live playback
-  progress
+  progress, plus optional tempo-matched auto-crossfade into the next visible track
 - Per-track waveform viewer with zoom/pan, BPM grid, and independent preview playback (seek and
   play a section without disturbing the main player)
 - Full metadata editor (title/artist/album/genre/cover art) from the Library or Playlist Builder
-- Live stats: tempo curve, energy curve, genre breakdown, totals — themed to match the active
+- Live stats: tempo curve, energy curve, genre breakdown, totals: themed to match the active
   color scheme
 - Export: save as `.m3u` / `.m3u8` (importable in Rekordbox and similar DJ software, with tags
   synced on exported copies), copy files in playlist order into a folder with numeric prefixes
   (`01 - Artist - Title.mp3`, ...), or save the playlist definition to the library
 - Remove tracks from the library without touching the files on disk
+- Duplicate detection for tracks with matching artist and title, including alternate file formats/bitrates
 - Multiple themes (dark, light, Rekordbox-style)
-- Local JSON library cache (no external database) — re-scanning only re-analyzes new/changed files
+- Local JSON library cache (no external database); re-scanning only re-analyzes new/changed files
 
 ## Running from source
 
@@ -84,11 +125,11 @@ python main.py
 
 Kept intentionally minimal for a small, portable build:
 
-- `PySide6` — UI, embedded player (QtMultimedia)
-- `numpy` — tempo/key/energy DSP (STFT, onset detection, autocorrelation, chroma)
-- `miniaudio` — lightweight audio decoding (mp3/wav/flac/ogg)
-- `mutagen` — reading and writing tags/cover art
-- `librosa` *(optional)* — improves tempo and key detection accuracy when installed; Setuno
+- `PySide6`: UI, embedded player (QtMultimedia)
+- `numpy`: tempo/key/energy DSP (STFT, onset detection, autocorrelation, chroma)
+- `miniaudio`: lightweight audio decoding (mp3/wav/flac/ogg)
+- `mutagen`: reading and writing tags/cover art
+- `librosa` *(optional)*: improves tempo and key detection accuracy when installed; Setuno
   automatically falls back to its built-in numpy-only detector if it isn't present
 
 ## Building the binaries yourself
@@ -104,9 +145,11 @@ To build locally instead:
 
 ```powershell
 pip install pyinstaller
-pyinstaller build.spec
+python -m PyInstaller --noconfirm build.spec
 # -> dist\Setuno.exe (portable, single file)
 ```
+
+`dist\Setuno.exe` is kept for release publishing; other transient build files remain ignored.
 
 Optionally wrap it in a proper installer with [Inno Setup](https://jrsoftware.org/isinfo.php):
 
@@ -145,15 +188,8 @@ hdiutil create -volname "Setuno" -srcfolder dist/Setuno.app -ov -format UDZO dis
 Useful DJ/radio/curator features not yet implemented, kept here as a backlog:
 
 - **Cue points & hot cues** — save/recall intro, drop, and outro markers per track.
-- **Auto-crossfade preview** — simulate the transition between two tracks (tempo-matched crossfade) directly in the embedded player.
-- **Key-lock / pitch preview** — preview a track at an adjusted BPM without changing pitch.
-- **Duplicate detection** — flag same-song duplicates (different files/bitrates) in the library.
 - **Vocal/instrumental detection** — tag tracks as vocal, instrumental, or acapella for smarter mixing.
-- **Smart re-shuffle** — regenerate just a portion of a playlist (e.g. the last 10 tracks) without rebuilding the whole set.
-- **Set history / play log** — track what was actually played (and when) across gigs, for reporting or PRO/royalty logging (useful for radio).
 - **Streaming service import** — import a Spotify/SoundCloud/Bandcamp playlist as a reference to match against the local library.
 - **Confidence score** — show a confidence indicator alongside auto-detected BPM/key for low-certainty tracks.
 - **Multiple output profiles** — export presets per target software (Rekordbox, Serato, Traktor, generic M3U) with their specific quirks/metadata.
-- **Energy curve templates** — named curve presets (e.g. "warm-up", "peak-time", "afters") that drive the energy-progression generator automatically.
-- **Cloud/network drive support** — tolerate slow or intermittently available paths (NAS, external drives) without blocking scans.
 
