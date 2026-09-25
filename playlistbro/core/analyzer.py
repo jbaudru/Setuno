@@ -5,7 +5,8 @@ genre features) is implemented with plain numpy so the packaged app stays
 small and portable. Tempo and key detection prefer `librosa`'s
 beat-tracking and chroma algorithms when that (optional) dependency is
 installed, since they are noticeably more accurate than the numpy-only
-fallbacks kept here for portability.
+fallbacks kept here for portability. `aubio` (also optional) is tried as a
+fast middle tier for tempo when librosa isn't available.
 """
 
 import hashlib
@@ -1935,10 +1936,12 @@ def _detect_key_from_stft(
 
 
 def _estimate_tempo_librosa(y: np.ndarray, sr: int):
-    """Try the librosa dynamic-programming beat tracker for a BPM estimate.
+    """Try librosa's beat tracker for a BPM estimate, cross-checked against
+    its tempogram to catch octave errors (half/double-time), which is the
+    most common failure mode for any single tempo estimator.
 
     Returns None (rather than raising) if librosa isn't installed or the
-    estimate fails, so the lightweight NumPy fallback always still works.
+    estimate fails, so lower-tier fallbacks always still work.
     """
     try:
         import librosa
@@ -1946,19 +1949,39 @@ def _estimate_tempo_librosa(y: np.ndarray, sr: int):
         return None
 
     try:
-        tempo = librosa.feature.tempo(
-            y=y.astype(np.float32),
-            sr=sr,
-            start_bpm=120.0,
-            max_tempo=MAX_BPM,
-        )
+        y32 = y.astype(np.float32)
 
-        bpm = float(tempo[0])
+        # Global beat-tracking estimate: dynamic programming over the full
+        # onset envelope, generally the single most reliable number librosa
+        # can give.
+        tempo_bt, _ = librosa.beat.beat_track(
+            y=y32, sr=sr, start_bpm=120.0, tightness=100,
+        )
+        tempo_bt = float(tempo_bt)
+
+        # Independent, local tempogram-based estimate, used purely as a
+        # cross-check: if it disagrees with the beat-tracker estimate by
+        # close to a factor of 2, that's the signature of an octave error.
+        local_tempi = librosa.feature.tempo(
+            y=y32, sr=sr, aggregate=None, start_bpm=120.0, max_tempo=MAX_BPM,
+        )
+        tempo_local = float(np.median(local_tempi)) if len(local_tempi) else tempo_bt
     except Exception:
         return None
 
-    if not np.isfinite(bpm) or bpm <= 0:
+    if not np.isfinite(tempo_bt) or tempo_bt <= 0:
         return None
+
+    bpm = tempo_bt
+
+    if tempo_local > 0 and np.isfinite(tempo_local):
+        ratio = tempo_bt / tempo_local
+        if 1.85 <= ratio <= 2.15 or 1.85 <= (1.0 / ratio) <= 2.15:
+            # prefer whichever candidate falls in the DJ-friendly range,
+            # a far more common playback tempo than very slow or very fast
+            in_range = [c for c in (tempo_bt, tempo_local) if 85.0 <= c <= 155.0]
+            if in_range:
+                bpm = in_range[0]
 
     # Fold octave errors (half/double time) into our supported BPM range.
     while bpm < MIN_BPM:
@@ -1970,16 +1993,67 @@ def _estimate_tempo_librosa(y: np.ndarray, sr: int):
     return bpm
 
 
+def _estimate_tempo_aubio(y: np.ndarray, sr: int):
+    """Try aubio's onset-based tempo tracker. None if aubio isn't installed.
+
+    aubio is a small, fast C library, so this tier costs almost nothing
+    time-wise, and is noticeably more reliable than the pure-NumPy
+    autocorrelation fallback below. Used only when librosa is unavailable.
+    """
+    try:
+        import aubio
+    except Exception:
+        return None
+
+    try:
+        win_size, hop_size = 1024, 512
+        detector = aubio.tempo("default", win_size, hop_size, sr)
+
+        samples = y.astype(np.float32)
+
+        for start in range(0, len(samples) - hop_size, hop_size):
+            chunk = samples[start:start + hop_size]
+
+            if len(chunk) < hop_size:
+                chunk = np.pad(chunk, (0, hop_size - len(chunk)))
+
+            detector(chunk)
+
+        bpm = float(detector.get_bpm())
+    except Exception:
+        return None
+
+    if not np.isfinite(bpm) or bpm <= 0:
+        return None
+
+    while bpm < MIN_BPM:
+        bpm *= 2.0
+
+    while bpm > MAX_BPM:
+        bpm /= 2.0
+
+    return bpm
+
+
 def _detect_key_librosa(y: np.ndarray, sr: int):
-    """Try librosa's constant-Q chroma for key detection. None on failure."""
+    """Try librosa's constant-Q chroma for key detection. None on failure.
+
+    Runs harmonic-percussive source separation first and computes chroma
+    only on the harmonic component: drum transients otherwise leak energy
+    into unrelated pitch classes and are the single biggest source of
+    wrong key detections.
+    """
     try:
         import librosa
     except Exception:
         return None
 
     try:
+        y32 = y.astype(np.float32)
+        harmonic = librosa.effects.harmonic(y32, margin=8.0)
+
         chroma = librosa.feature.chroma_cqt(
-            y=y.astype(np.float32),
+            y=harmonic,
             sr=sr,
             hop_length=KEY_HOP_SIZE,
         )
@@ -3177,8 +3251,14 @@ def analyze_file(filepath: str) -> dict:
 
     # Prefer librosa's dynamic-programming beat tracker when available; it
     # is considerably more robust than the hand-rolled autocorrelation
-    # fallback below. That fallback only runs if librosa isn't installed.
+    # fallback below. If librosa isn't installed, try aubio next: a fast,
+    # small C library that's still noticeably more reliable than the plain
+    # NumPy autocorrelation tier. Only if neither is installed do we fall
+    # all the way back to the dedicated kick/snare onset analysis.
     tempo = _estimate_tempo_librosa(y, ANALYSIS_SR)
+
+    if tempo is None:
+        tempo = _estimate_tempo_aubio(y, ANALYSIS_SR)
 
     if tempo is None:
         # Dedicated beat-resolution STFT.
@@ -3237,8 +3317,9 @@ def analyze_file(filepath: str) -> dict:
     # Key
     # ------------------------------------------------------------------
 
-    # Same idea as tempo: librosa's constant-Q chroma is a better basis for
-    # key detection than our plain-STFT chroma, when it's available.
+    # Same idea as tempo: librosa's constant-Q chroma (computed on the
+    # harmonic-separated signal) is a better basis for key detection than
+    # our plain-STFT chroma, when it's available.
     key_name = _detect_key_librosa(y, ANALYSIS_SR)
 
     if key_name is None:

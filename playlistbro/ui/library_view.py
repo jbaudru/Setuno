@@ -94,6 +94,8 @@ class ScanWorker(QThread):
 
 
 class LibraryView(QWidget):
+    STATUS_MAX_WIDTH = 400  # cap how much horizontal space the status text can claim
+
     def __init__(
         self, db: Database, on_library_changed=None, on_play_track=None,
         get_library_folders=None, set_library_folders=None, on_queue_track=None,
@@ -139,6 +141,7 @@ class LibraryView(QWidget):
         self._search_timer.setInterval(180)
         self._search_timer.timeout.connect(self.refresh_table)
         self.status_label = QLabel("")
+        self.status_label.setMaximumWidth(self.STATUS_MAX_WIDTH)
         self.columns_btn = QToolButton()
         self.columns_btn.setIcon(icon("columns"))
         self.columns_btn.setToolTip("Choose visible columns")
@@ -191,8 +194,8 @@ class LibraryView(QWidget):
         layout.addWidget(self.progress_bar)
         status_row = QHBoxLayout()
         status_row.addWidget(self.status_label)
-        status_row.addWidget(self.columns_btn)
         status_row.addStretch(1)
+        status_row.addWidget(self.columns_btn)
         layout.addLayout(status_row)
         layout.addWidget(self.table)
 
@@ -204,6 +207,13 @@ class LibraryView(QWidget):
 
         self._refresh_folder_combo(self.get_library_folders())
         self.refresh_from_db()
+
+    def _set_status(self, text: str) -> None:
+        """Set the status label, eliding long text and keeping the full text as a tooltip."""
+        metrics = self.status_label.fontMetrics()
+        elided = metrics.elidedText(text, Qt.ElideRight, self.STATUS_MAX_WIDTH)
+        self.status_label.setText(elided)
+        self.status_label.setToolTip(text if elided != text else "")
 
     def choose_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Select music folder")
@@ -283,7 +293,7 @@ class LibraryView(QWidget):
         if self.worker:
             self.worker.cancel()
             self.stop_btn.setEnabled(False)
-            self.status_label.setText("Stopping...")
+            self._set_status("Stopping...")
 
     def _set_column_visible(self, column: int, visible: bool):
         self.table.setColumnHidden(column, not visible)
@@ -295,7 +305,7 @@ class LibraryView(QWidget):
         if total:
             self.progress_bar.setMaximum(total)
             self.progress_bar.setValue(done)
-        self.status_label.setText(f"Analyzing ({done}/{total}): {name}")
+        self._set_status(f"Analyzing ({done}/{total}): {name}")
 
     def _on_track_ready(self, track: Track):
         """Insert/update a track as soon as it's analyzed, so the list fills in live."""
@@ -328,7 +338,7 @@ class LibraryView(QWidget):
         self.scan_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self.stop_btn.setVisible(False)
-        self.status_label.setText("Scan complete.")
+        self._set_status("Scan complete.")
         if self._pending_folder:
             self._register_scanned_folder(self._pending_folder)
             self._pending_folder = None
@@ -404,7 +414,7 @@ class LibraryView(QWidget):
             )
             self.table.setCellWidget(r, WAVEFORM_COL, waveform)
         self.table.setSortingEnabled(True)
-        self.status_label.setText(f"{len(rows)} track(s) in library")
+        self._set_status(f"{len(rows)} track(s) in library")
         self._apply_playing_marker()
 
     def get_row_ids(self) -> list[int]:

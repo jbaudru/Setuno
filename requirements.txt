@@ -6,3 +6,7 @@ pyinstaller>=6.3
 # Optional: improves tempo/key detection accuracy (analyzer.py falls back
 # to a pure-numpy method automatically if this isn't installed).
 librosa>=0.10
+# Optional: fast fallback tempo detector used only when librosa isn't
+# installed (analyzer.py falls back further to a pure-numpy method if
+# neither is installed).
+aubio==0.4.7

@@ -411,7 +411,7 @@ class MainWindow(QMainWindow):
         # Description
         text = QLabel(
             "<h2>Setuno</h2>"
-            "<h3>v1.0.2</h3>"
+            "<h3>v1.1.0</h3>"
             "<p>"
             "A local, offline companion for DJs, radio hosts, and playlist curators. "
             "It scans your music folders, analyzes each track's tempo, musical key and "

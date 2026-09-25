@@ -1,22 +1,22 @@
 {
   "theme": "light",
   "library_folders": [
-    "D:\\\\Music\\\\PLAYLIST",
+    "D:/Music/PLAYLIST/DEEP",
+    "D:/Music/PLAYLIST/DNB - GYM",
+    "D:/Music/PLAYLIST/DNB - TECH",
     "D:/Music/PLAYLIST/HARD TECHNO GYM",
-    "D:/Music/PLAYLIST/LOUNG - HOUSE",
-    "D:/Music/PLAYLIST/BANDCAMP",
-    "D:/Music/PLAYLIST/UK BASSLINE",
-    "D:/Music/PLAYLIST/Zushiboyz's T\u00e9tralogie -20240926T170648Z-001/Zushiboyz_s T\u00e9tralogie/Zushiboyz",
+    "D:/Music/PLAYLIST/HOUSE/Bass House",
+    "D:/Music/PLAYLIST/HOUSE/Garage House Essentials",
+    "D:/Music/PLAYLIST/HOUSE/HOUSE BASS (ZOMBADAS)",
     "D:/Music/PLAYLIST/HOUSE/House Season 2024",
     "D:/Music/PLAYLIST/HOUSE/NCS Bass House",
-    "D:/Music/PLAYLIST/HOUSE",
-    "D:/Music/PLAYLIST/DEEP",
-    "D:/Music/PLAYLIST/DNB - TECH",
+    "D:/Music/PLAYLIST/HOUSE/UK Garage Classics",
+    "D:/Music/PLAYLIST/HOUSE/UKF Bassline & UK Garage",
     "D:/Music/PLAYLIST/LIQUID - JUNGLE - BREAKCORE",
-    "D:/Music/PLAYLIST/RAP & HOUSE REMIX",
-    "C:/Users/julie/Music/Playlist/dnb",
-    "C:/Users/julie/Music/Playlist/Zara House",
-    "C:/Users/julie/Music/Playlist"
+    "D:/Music/PLAYLIST/LOUNG - HOUSE",
+    "D:/Music/PLAYLIST/TECHNO WORKOUT 2026",
+    "D:/Music/PLAYLIST/BANDCAMP",
+    "D:/Music/PLAYLIST/DJ"
   ],
   "library_visible_columns": [
     "\u2665",
@@ -29,6 +29,7 @@
     "Camelot",
     "Energy",
     "Duration",
+    "Added",
     "Waveform"
   ]
 }
