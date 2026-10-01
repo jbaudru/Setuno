@@ -5,7 +5,6 @@
 
   **A local, offline companion for DJs, radio hosts, and playlist curators.**
 
-  [![Latest release](https://img.shields.io/github/v/release/jbaudru/Setuno)](https://github.com/jbaudru/Setuno/releases/latest)
 </div>
 
 Setuno scans music folders (recursively), analyzes each track's **tempo (BPM)**, **musical
