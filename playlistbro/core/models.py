@@ -13,6 +13,7 @@ class Track:
     genre: str = ""
     duration: float = 0.0          # seconds
     tempo: float = 0.0             # BPM
+    beat_offset: Optional[float] = None  # measured phase of the beat grid in seconds
     key_name: str = ""             # e.g. "A minor"
     camelot: str = ""              # e.g. "8A"
     energy_raw: float = 0.0

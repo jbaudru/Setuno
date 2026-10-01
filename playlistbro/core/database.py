@@ -1,6 +1,7 @@
 """Local JSON persistence layer for tracks and playlists (no external DB)."""
 import json
 import os
+import shutil
 import sys
 import threading
 from datetime import datetime, timezone
@@ -11,18 +12,47 @@ from .models import Track
 
 
 def default_data_dir() -> Path:
-    """Folder next to the app (or project root when run from source) holding data/*.json."""
-    if getattr(sys, "frozen", False):
-        base = Path(sys.executable).resolve().parent
+    """Writable per-user Setuno/data directory, shared by source and packaged builds."""
+    if sys.platform == "win32":
+        root = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
+    elif sys.platform == "darwin":
+        root = Path.home() / "Library" / "Application Support"
     else:
-        base = Path(__file__).resolve().parent.parent.parent
-    data_dir = base / "data"
+        root = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share")
+    data_dir = root / "Setuno" / "data"
     data_dir.mkdir(parents=True, exist_ok=True)
+
+    if getattr(sys, "frozen", False):
+        legacy = Path(sys.executable).resolve().parent / "data"
+    else:
+        legacy = Path(__file__).resolve().parent.parent.parent / "data"
+    if legacy != data_dir and legacy.is_dir():
+        for name in ("library.json", "playlists.json", "settings.json"):
+            source, destination = legacy / name, data_dir / name
+            if source.is_file() and not destination.exists():
+                shutil.copy2(source, destination)
+                if name == "library.json":
+                    try:
+                        records = json.loads(destination.read_text(encoding="utf-8"))
+                    except (OSError, json.JSONDecodeError):
+                        records = None
+                    if isinstance(records, list):
+                        for record in records:
+                            cover = record.get("cover_path")
+                            if cover:
+                                try:
+                                    relative = Path(cover).resolve().relative_to((legacy / "covers").resolve())
+                                    record["cover_path"] = str(data_dir / "covers" / relative)
+                                except ValueError:
+                                    pass
+                        destination.write_text(json.dumps(records, separators=(",", ":")), encoding="utf-8")
+        if (legacy / "covers").is_dir() and not (data_dir / "covers").exists():
+            shutil.copytree(legacy / "covers", data_dir / "covers")
     return data_dir
 
 
 class Database:
-    """Thread-safe JSON-file-backed store. Data lives in <app>/data/library.json and playlists.json."""
+    """Thread-safe JSON-file-backed store in the per-user Setuno/data directory."""
 
     def __init__(self, data_dir: Optional[Path] = None):
         self.data_dir = data_dir or default_data_dir()
@@ -105,6 +135,7 @@ class Database:
             record = {
                 "id": track_id, "filepath": t.filepath, "title": title, "artist": artist,
                 "album": album, "genre": genre, "duration": t.duration, "tempo": tempo,
+                "beat_offset": None if tempo_manual else t.beat_offset,
                 "key_name": key_name, "camelot": camelot, "energy_raw": t.energy_raw,
                 "energy": t.energy, "loudness": t.loudness, "filesize": t.filesize, "mtime": t.mtime, "added_at": added_at,
                 "tempo_manual": tempo_manual, "key_manual": key_manual, "metadata_manual": metadata_manual,
@@ -131,6 +162,7 @@ class Database:
             if not record:
                 return
             record["tempo"] = round(float(bpm))
+            record["beat_offset"] = None
             record["tempo_manual"] = True
             self._save_tracks()
 
@@ -235,6 +267,7 @@ class Database:
             id=r["id"], filepath=r["filepath"], title=r.get("title") or "",
             artist=r.get("artist") or "", album=r.get("album") or "", genre=r.get("genre") or "",
             duration=r.get("duration") or 0.0, tempo=r.get("tempo") or 0.0,
+            beat_offset=r.get("beat_offset"),
             key_name=r.get("key_name") or "", camelot=r.get("camelot") or "",
             energy_raw=r.get("energy_raw") or 0.0, energy=r.get("energy") or 0.0,
             loudness=r.get("loudness") or 0.0,

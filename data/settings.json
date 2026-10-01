@@ -1,23 +1,8 @@
 {
   "theme": "light",
   "library_folders": [
-    "D:/Music/PLAYLIST/DEEP",
-    "D:/Music/PLAYLIST/DNB - GYM",
-    "D:/Music/PLAYLIST/DNB - TECH",
-    "D:/Music/PLAYLIST/HARD TECHNO GYM",
-    "D:/Music/PLAYLIST/HOUSE/Bass House",
-    "D:/Music/PLAYLIST/HOUSE/Garage House Essentials",
-    "D:/Music/PLAYLIST/HOUSE/HOUSE BASS (ZOMBADAS)",
-    "D:/Music/PLAYLIST/HOUSE/House Season 2024",
-    "D:/Music/PLAYLIST/HOUSE/NCS Bass House",
-    "D:/Music/PLAYLIST/HOUSE/UK Garage Classics",
-    "D:/Music/PLAYLIST/HOUSE/UKF Bassline & UK Garage",
-    "D:/Music/PLAYLIST/LIQUID - JUNGLE - BREAKCORE",
-    "D:/Music/PLAYLIST/LOUNG - HOUSE",
-    "D:/Music/PLAYLIST/TECHNO WORKOUT 2026",
-    "D:/Music/PLAYLIST/BANDCAMP",
-    "D:/Music/PLAYLIST/DJ"
   ],
+  "show_level_meter": true,
   "library_visible_columns": [
     "\u2665",
     "Title",

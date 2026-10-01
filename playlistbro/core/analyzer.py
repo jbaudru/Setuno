@@ -208,7 +208,7 @@ def set_cover_art(filepath: str, image_path: str) -> str:
     try:
         image_bytes = Path(image_path).read_bytes()
 
-        if ext in (".mp3", ".wav"):
+        if ext == ".mp3":
             from mutagen.id3 import ID3, ID3NoHeaderError, APIC
 
             try:
@@ -219,6 +219,17 @@ def set_cover_art(filepath: str, image_path: str) -> str:
             tags.delall("APIC")
             tags.add(APIC(encoding=3, mime=mime, type=3, desc="Cover", data=image_bytes))
             tags.save(filepath)
+
+        elif ext == ".wav":
+            from mutagen.id3 import APIC
+            from mutagen.wave import WAVE
+
+            audio = WAVE(filepath)
+            if audio.tags is None:
+                audio.add_tags()
+            audio.tags.delall("APIC")
+            audio.tags.add(APIC(encoding=3, mime=mime, type=3, desc="Cover", data=image_bytes))
+            audio.save()
 
         elif ext == ".flac":
             from mutagen.flac import FLAC, Picture
@@ -264,7 +275,7 @@ def clear_cover_art(filepath: str) -> str:
     ext = Path(filepath).suffix.lower()
 
     try:
-        if ext in (".mp3", ".wav"):
+        if ext == ".mp3":
             from mutagen.id3 import ID3, ID3NoHeaderError
 
             try:
@@ -274,6 +285,14 @@ def clear_cover_art(filepath: str) -> str:
 
             tags.delall("APIC")
             tags.save(filepath)
+
+        elif ext == ".wav":
+            from mutagen.wave import WAVE
+
+            audio = WAVE(filepath)
+            if audio.tags:
+                audio.tags.delall("APIC")
+                audio.save()
 
         elif ext == ".flac":
             from mutagen.flac import FLAC
@@ -318,6 +337,7 @@ def _decode_audio(filepath: str):
     )
 
     full_duration = len(samples) / float(ANALYSIS_SR)
+    window_start = 0.0
 
     if full_duration > ANALYSIS_MAX_SECONDS:
         start = int(
@@ -331,10 +351,11 @@ def _decode_audio(filepath: str):
         )
 
         window = samples[start:end]
+        window_start = start / ANALYSIS_SR
     else:
         window = samples
 
-    return window, full_duration
+    return window, full_duration, _downsample_waveform_peaks(samples, 2400), window_start
 
 
 # ---------------------------------------------------------------------------
@@ -1709,10 +1730,7 @@ def _detect_key(chroma: np.ndarray) -> str:
         or not np.all(np.isfinite(chroma))
         or chroma.sum() <= 1e-12
     ):
-        return normalize_key_name(
-            "C",
-            "major",
-        )
+        return ""
 
     best_score = -np.inf
     best_key = (
@@ -1891,10 +1909,7 @@ def _detect_key_from_stft(
 ) -> str:
     """Segment-wise key detection with confidence-weighted voting."""
     if key_mag.shape[0] == 0:
-        return normalize_key_name(
-            "C",
-            "major",
-        )
+        return ""
 
     # Divide the track into several temporal regions up front, then build
     # one chroma vector per segment for the shared voting logic.
@@ -1935,7 +1950,7 @@ def _detect_key_from_stft(
     return _vote_key_from_chroma_segments(chroma_frames, fallback_chroma)
 
 
-def _estimate_tempo_librosa(y: np.ndarray, sr: int):
+def _estimate_tempo_librosa(y: np.ndarray, sr: int, beat_grid=None, window_start=0.0):
     """Try librosa's beat tracker for a BPM estimate, cross-checked against
     its tempogram to catch octave errors (half/double-time), which is the
     most common failure mode for any single tempo estimator.
@@ -1954,10 +1969,10 @@ def _estimate_tempo_librosa(y: np.ndarray, sr: int):
         # Global beat-tracking estimate: dynamic programming over the full
         # onset envelope, generally the single most reliable number librosa
         # can give.
-        tempo_bt, _ = librosa.beat.beat_track(
+        tempo_bt, beat_frames = librosa.beat.beat_track(
             y=y32, sr=sr, start_bpm=120.0, tightness=100,
         )
-        tempo_bt = float(tempo_bt)
+        tempo_bt = float(np.asarray(tempo_bt).reshape(-1)[0])
 
         # Independent, local tempogram-based estimate, used purely as a
         # cross-check: if it disagrees with the beat-tracker estimate by
@@ -1989,6 +2004,16 @@ def _estimate_tempo_librosa(y: np.ndarray, sr: int):
 
     while bpm > MAX_BPM:
         bpm /= 2.0
+
+    if beat_grid is not None and len(beat_frames) >= 4:
+        beat_times = librosa.frames_to_time(beat_frames, sr=sr)
+        indices = np.arange(len(beat_times))
+        period, phase = np.polyfit(indices, beat_times, 1)
+        residual = np.median(np.abs(beat_times - (period * indices + phase)))
+        fitted_bpm = 60.0 / period if period > 0 else 0.0
+        if residual < 0.04 and abs(fitted_bpm - bpm) / bpm < 0.04:
+            bpm = fitted_bpm
+            beat_grid["offset"] = float((phase + window_start) % period)
 
     return bpm
 
@@ -2043,6 +2068,9 @@ def _detect_key_librosa(y: np.ndarray, sr: int):
     into unrelated pitch classes and are the single biggest source of
     wrong key detections.
     """
+    if not len(y) or np.max(np.abs(y)) < 1e-5:
+        return ""
+
     try:
         import librosa
     except Exception:
@@ -2683,15 +2711,9 @@ def _rhythmic_features(
         )
         > 1e-12
     ):
-        acf = np.correlate(
-            x_centered,
-            x_centered,
-            mode="full",
-        )
-
-        acf = acf[
-            len(x) - 1:
-        ]
+        fft_size = 1 << (2 * len(x) - 1).bit_length()
+        spectrum = np.fft.rfft(x_centered, fft_size)
+        acf = np.fft.irfft(np.abs(spectrum) ** 2, fft_size)[:min(len(x), 100)]
 
         if acf[0] > 1e-12:
             acf /= acf[0]
@@ -3002,6 +3024,17 @@ GENRE_PROFILES = {
     },
 }
 
+GENRE_FOLDERS = {name.casefold(): name for name in GENRE_PROFILES}
+GENRE_FOLDERS["bass house"] = "Bass House"
+
+
+def _genre_from_folder(filepath: str) -> str:
+    for folder in Path(filepath).parent.parts[::-1]:
+        genre = GENRE_FOLDERS.get(_clean_genre_tag(folder).casefold())
+        if genre:
+            return genre
+    return ""
+
 
 def _feature_vector(features: dict, tempo: float) -> dict:
     """Build the normalized feature vector consumed by the genre classifier."""
@@ -3088,6 +3121,13 @@ def _estimate_genre(
 
     if metadata_genre:
         return metadata_genre
+
+    folder_genre = tags.get("_folder_genre", "")
+    if folder_genre:
+        return folder_genre
+
+    if tags.get("_silent"):
+        return ""
 
     features = tags.get(
         "_genre_features",
@@ -3234,9 +3274,10 @@ def analyze_file(filepath: str) -> dict:
         filepath
     )
 
-    y, full_duration = _decode_audio(
+    y, full_duration, waveform_peaks, window_start = _decode_audio(
         filepath
     )
+    silent = not len(y) or np.max(np.abs(y)) < 1e-5
 
     # ------------------------------------------------------------------
     # Tempo
@@ -3255,7 +3296,10 @@ def analyze_file(filepath: str) -> dict:
     # small C library that's still noticeably more reliable than the plain
     # NumPy autocorrelation tier. Only if neither is installed do we fall
     # all the way back to the dedicated kick/snare onset analysis.
-    tempo = _estimate_tempo_librosa(y, ANALYSIS_SR)
+    beat_grid = {}
+    tempo = 0.0 if silent else _estimate_tempo_librosa(
+        y, ANALYSIS_SR, beat_grid=beat_grid, window_start=window_start,
+    )
 
     if tempo is None:
         tempo = _estimate_tempo_aubio(y, ANALYSIS_SR)
@@ -3300,13 +3344,7 @@ def analyze_file(filepath: str) -> dict:
             TEMPO_HOP_SIZE,
         )
 
-    tempo = float(
-        np.clip(
-            tempo,
-            MIN_BPM,
-            MAX_BPM,
-        )
-    )
+    tempo = float(np.clip(tempo, MIN_BPM, MAX_BPM)) if tempo else 0.0
 
     # General onset envelope is still used for genre/rhythmic features.
     onset_env = _onset_envelope(
@@ -3457,6 +3495,9 @@ def analyze_file(filepath: str) -> dict:
         tags
     )
 
+    genre_tags["_folder_genre"] = _genre_from_folder(filepath)
+    genre_tags["_silent"] = silent
+
     genre_tags[
         "_genre_features"
     ] = genre_features
@@ -3476,8 +3517,6 @@ def analyze_file(filepath: str) -> dict:
             ANALYSIS_SR,
         )
     )
-    waveform_peaks = compute_waveform_peaks(filepath)
-
     cover_path = _extract_cover(
         filepath
     )
@@ -3499,9 +3538,8 @@ def analyze_file(filepath: str) -> dict:
         "duration": float(
             full_duration
         ),
-        # DJ-oriented BPM as a whole number; industry-standard displays
-        # (Rekordbox, Serato, etc.) essentially never show a decimal.
-        "tempo": round(tempo),
+        "tempo": round(tempo, 2),
+        "beat_offset": beat_grid.get("offset"),
         "key_name": key_name,
         "camelot": camelot,
 
@@ -3536,7 +3574,7 @@ def analyze_file(filepath: str) -> dict:
 
 def compute_waveform_peaks(
     filepath: str,
-    num_points: int = 600,
+    num_points: int = 2400,
 ) -> list:
     """Decode the full file and downsample to peak amplitudes."""
     import miniaudio
@@ -3553,6 +3591,11 @@ def compute_waveform_peaks(
         dtype=np.float32,
     )
 
+    return _downsample_waveform_peaks(samples, num_points)
+
+
+def _downsample_waveform_peaks(samples: np.ndarray, num_points: int) -> list:
+
     if len(samples) == 0:
         return [
             0.0
@@ -3564,33 +3607,9 @@ def compute_waveform_peaks(
         ).max()
     ) or 1.0
 
-    chunk = max(
-        1,
-        len(samples)
-        // num_points,
-    )
-
-    peaks = []
-
-    for i in range(
-        num_points
-    ):
-        start = (
-            i * chunk
-        )
-
-        seg = samples[
-            start:
-            start + chunk
-        ]
-
-        peaks.append(
-            float(
-                np.abs(seg).max()
-            )
-            / peak
-            if len(seg)
-            else 0.0
-        )
-
-    return peaks
+    boundaries = np.linspace(0, len(samples), num_points + 1, dtype=int)
+    absolute = np.abs(samples)
+    return [
+        float(absolute[start:end].max() / peak) if end > start else 0.0
+        for start, end in zip(boundaries[:-1], boundaries[1:])
+    ]

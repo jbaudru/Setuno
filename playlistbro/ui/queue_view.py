@@ -3,15 +3,15 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QBrush, QColor
 from PySide6.QtWidgets import (
     QAbstractItemView, QHBoxLayout, QHeaderView, QPushButton, QTableWidget,
-    QTableWidgetItem, QVBoxLayout, QWidget,
+    QTableWidgetItem, QToolButton, QVBoxLayout, QWidget,
 )
 
 from ..core.database import Database
 from ..core.scanner import is_readable_file
-from .icon_loader import cover_pixmap
+from .icon_loader import cover_pixmap, icon
 from .library_view import (
     BPM_COL, COLUMNS, FAV_COL, FAVORITE_COLOR, NumericTableWidgetItem,
-    TITLE_COL, UNAVAILABLE_COLOR, UNFAVORITE_COLOR, WAVEFORM_COL,
+    TITLE_COL, UNAVAILABLE_COLOR, UNFAVORITE_COLOR, WAVEFORM_COL, show_in_file_explorer,
 )
 from .waveform_view import MiniWaveform
 
@@ -35,11 +35,17 @@ class QueueView(QWidget):
         self.clear_btn = QPushButton("Clear queue")
         self.remove_btn.clicked.connect(self.remove_selected)
         self.clear_btn.clicked.connect(self.clear)
+        self.explorer_btn = QToolButton()
+        self.explorer_btn.setIcon(icon("folder"))
+        self.explorer_btn.setToolTip("Show selected song in File Explorer")
+        self.explorer_btn.setEnabled(False)
+        self.explorer_btn.clicked.connect(self._show_selected_in_explorer)
 
         controls = QHBoxLayout()
         controls.addWidget(self.remove_btn)
         controls.addWidget(self.clear_btn)
         controls.addStretch(1)
+        controls.addWidget(self.explorer_btn)
 
         self.table = QTableWidget(0, len(COLUMNS))
         self.table.setHorizontalHeaderLabels(COLUMNS)
@@ -49,6 +55,7 @@ class QueueView(QWidget):
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.doubleClicked.connect(self._play_selected)
+        self.table.itemSelectionChanged.connect(self._update_explorer_button)
         for column, width in enumerate([30, 220, 100, 100, 100, 60, 70, 70, 70, 100, 145, 75]):
             self.table.setColumnWidth(column, width)
 
@@ -91,6 +98,20 @@ class QueueView(QWidget):
         self.refresh()
         if track:
             self.on_play_track(track)
+
+    def _selected_track(self):
+        rows = self.table.selectionModel().selectedRows()
+        item = self.table.item(rows[0].row(), FAV_COL) if rows else None
+        return self.db.get_track(item.data(1000)) if item else None
+
+    def _update_explorer_button(self):
+        track = self._selected_track()
+        self.explorer_btn.setEnabled(bool(track and is_readable_file(track.filepath)))
+
+    def _show_selected_in_explorer(self):
+        track = self._selected_track()
+        if track:
+            show_in_file_explorer(track.filepath)
 
     def remove_selected(self):
         rows = sorted({index.row() for index in self.table.selectionModel().selectedRows()}, reverse=True)

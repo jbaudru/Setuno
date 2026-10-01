@@ -1,13 +1,15 @@
 """Library tab: folder scanning and full track listing."""
+import os
 import random
+import time
 from pathlib import Path
 
-from PySide6.QtCore import QThread, QTimer, Qt, Signal
+from PySide6.QtCore import QProcess, QThread, QTimer, Qt, Signal
 from PySide6.QtGui import QBrush, QColor
 from PySide6.QtWidgets import (
     QAbstractItemView, QComboBox, QDialog, QFileDialog, QHBoxLayout, QHeaderView, QLabel,
-    QLineEdit, QListWidget, QMenu, QMessageBox, QProgressBar, QPushButton, QTableWidget,
-    QTableWidgetItem, QToolButton, QVBoxLayout, QWidget,
+    QLineEdit, QListView, QListWidget, QMenu, QMessageBox, QProgressBar, QPushButton, QTableWidget,
+    QTableWidgetItem, QToolButton, QTreeView, QVBoxLayout, QWidget,
 )
 
 from ..core.database import Database
@@ -26,6 +28,12 @@ FAVORITE_COLOR = "#e0435c"
 UNFAVORITE_COLOR = "#6b6b85"
 UNAVAILABLE_COLOR = "#e06c48"
 PLAYED_COLOR = "#38a169"
+
+
+def show_in_file_explorer(filepath: str):
+    if is_readable_file(filepath):
+        explorer = str(Path(os.environ.get("SystemRoot", "C:/Windows")) / "explorer.exe")
+        QProcess.startDetached(explorer, ["/select,", str(Path(filepath).resolve())])
 
 class NumericTableWidgetItem(QTableWidgetItem):
     """QTableWidgetItem that sorts using its numeric UserRole value."""
@@ -69,10 +77,9 @@ class _FolderManagerDialog(QDialog):
 
 class ScanWorker(QThread):
     progress = Signal(int, int, str)
-    track_ready = Signal(object)
     finished_ok = Signal()
 
-    def __init__(self, folder: str, db: Database, force: bool = False):
+    def __init__(self, folder: str | list[str], db: Database, force: bool = False):
         super().__init__()
         self.folder = folder
         self.db = db
@@ -83,10 +90,18 @@ class ScanWorker(QThread):
         self._cancel = True
 
     def run(self):
+        last_progress = 0.0
+
+        def report_progress(done, total, name):
+            nonlocal last_progress
+            now = time.monotonic()
+            if done == total or name.startswith("ERROR ") or now - last_progress >= 0.1:
+                self.progress.emit(done, total, name)
+                last_progress = now
+
         scan_folder(
             self.folder, self.db,
-            progress_cb=lambda d, t, n: self.progress.emit(d, t, n),
-            track_cb=lambda track: self.track_ready.emit(track),
+            progress_cb=report_progress,
             should_cancel=lambda: self._cancel,
             force=self.force,
         )
@@ -95,6 +110,7 @@ class ScanWorker(QThread):
 
 class LibraryView(QWidget):
     STATUS_MAX_WIDTH = 400  # cap how much horizontal space the status text can claim
+    PAGE_SIZE = 200
 
     def __init__(
         self, db: Database, on_library_changed=None, on_play_track=None,
@@ -113,9 +129,15 @@ class LibraryView(QWidget):
         self.set_visible_columns = set_visible_columns or (lambda _columns: None)
         self.tracks: list[Track] = []
         self._search_cache: dict[int, str] = {}
+        self._resolved_paths: dict[int, Path] = {}
+        self._duplicate_counts: dict[tuple[str, str], int] = {}
+        self._matched_tracks: list[Track] = []
+        self._matched_query = ""
+        self._matched_folder = None
+        self._shown_count = self.PAGE_SIZE
         self.worker: ScanWorker | None = None
         self._refresh_pending = False
-        self._pending_folder: str | None = None
+        self._pending_folders: list[str] = []
         self.playing_track_id: int | None = None
         self._playing_bg = "#8686AC"
         self.waveform_dialog: WaveformDialog | None = None
@@ -123,7 +145,7 @@ class LibraryView(QWidget):
         self._wave_bass = "#8686AC"
         self._wave_treble = "#d8d8ec"
 
-        self.scan_btn = QPushButton(" Scan Folder...")
+        self.scan_btn = QPushButton(" Scan Folders...")
         self.scan_btn.setIcon(icon("folder"))
         self.stop_btn = QPushButton(" Stop")
         self.stop_btn.setIcon(icon("stop"))
@@ -161,8 +183,16 @@ class LibraryView(QWidget):
             action.toggled.connect(lambda visible, column=column: self._set_column_visible(column, visible))
             self._column_actions.append(action)
         self.columns_btn.setMenu(columns_menu)
+        self.explorer_btn = QToolButton()
+        self.explorer_btn.setIcon(icon("folder"))
+        self.explorer_btn.setToolTip("Show selected song in File Explorer")
+        self.explorer_btn.setEnabled(False)
+        self.explorer_btn.clicked.connect(self._show_selected_in_explorer)
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
+        self.more_btn = QPushButton("Load more")
+        self.more_btn.setVisible(False)
+        self.more_btn.clicked.connect(self._load_more)
 
         top = QHBoxLayout()
         top.addWidget(self.scan_btn)
@@ -179,6 +209,7 @@ class LibraryView(QWidget):
         self.table.setAlternatingRowColors(True)
         self.table.setSortingEnabled(True)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.table.horizontalHeader().sortIndicatorChanged.connect(self._sort_changed)
         self.table.horizontalHeader().setStretchLastSection(True)
         for col, width in enumerate([30, 220, 100, 100, 100, 60, 70, 70, 70, 100, 145, 75]):
             self.table.setColumnWidth(col, width)
@@ -188,6 +219,7 @@ class LibraryView(QWidget):
         self.table.cellClicked.connect(self._on_cell_clicked)
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._show_context_menu)
+        self.table.itemSelectionChanged.connect(self._update_explorer_button)
 
         layout = QVBoxLayout(self)
         layout.addLayout(top)
@@ -195,9 +227,11 @@ class LibraryView(QWidget):
         status_row = QHBoxLayout()
         status_row.addWidget(self.status_label)
         status_row.addStretch(1)
+        status_row.addWidget(self.explorer_btn)
         status_row.addWidget(self.columns_btn)
         layout.addLayout(status_row)
         layout.addWidget(self.table)
+        layout.addWidget(self.more_btn)
 
         self.scan_btn.clicked.connect(self.choose_folder)
         self.stop_btn.clicked.connect(self.stop_scan)
@@ -216,21 +250,27 @@ class LibraryView(QWidget):
         self.status_label.setToolTip(text if elided != text else "")
 
     def choose_folder(self):
-        folder = QFileDialog.getExistingDirectory(self, "Select music folder")
-        if not folder:
+        dialog = QFileDialog(self, "Select music folders")
+        dialog.setFileMode(QFileDialog.Directory)
+        dialog.setOption(QFileDialog.DontUseNativeDialog, True)
+        for view in dialog.findChildren(QListView) + dialog.findChildren(QTreeView):
+            view.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        if not dialog.exec():
             return
-        force = self._prompt_rescan_mode(folder)
+        folders = list(dict.fromkeys(dialog.selectedFiles()))
+        if not folders:
+            return
+        force = self._prompt_rescan_mode(folders)
         if force is None:
             return  # user cancelled
-        self._pending_folder = folder
+        self._pending_folders = folders
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
         self.scan_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         self.stop_btn.setVisible(True)
-        self.worker = ScanWorker(folder, self.db, force=force)
+        self.worker = ScanWorker(folders, self.db, force=force)
         self.worker.progress.connect(self._on_progress)
-        self.worker.track_ready.connect(self._on_track_ready)
         self.worker.finished_ok.connect(self._on_scan_done)
         self.worker.start()
 
@@ -260,14 +300,14 @@ class LibraryView(QWidget):
         self.folder_combo.setCurrentIndex(idx if idx >= 0 else 0)
         self.folder_combo.blockSignals(False)
 
-    def _prompt_rescan_mode(self, folder: str):
-        """If `folder` was already scanned before, ask whether to fully rescan or only
+    def _prompt_rescan_mode(self, folders: list[str]):
+        """If any folder was already scanned before, ask whether to fully rescan or only
         analyze new/changed files. Returns True (force), False (incremental), or None (cancel).
         """
-        folder_norm = str(Path(folder).resolve()).lower()
         existing = self.db.get_existing_filepaths()
         already_scanned = any(
-            str(Path(p).resolve()).lower().startswith(folder_norm) for p in existing
+            is_within_folder(path, folder)
+            for path in existing for folder in folders
         )
         if not already_scanned:
             return False
@@ -307,21 +347,6 @@ class LibraryView(QWidget):
             self.progress_bar.setValue(done)
         self._set_status(f"Analyzing ({done}/{total}): {name}")
 
-    def _on_track_ready(self, track: Track):
-        """Insert/update a track as soon as it's analyzed, so the list fills in live."""
-        """
-        for i, existing in enumerate(self.tracks):
-            if existing.id == track.id:
-                self.tracks[i] = track
-                break
-        else:
-            self.tracks.append(track)
-        if self.on_library_changed:
-            self.on_library_changed()
-        self._schedule_refresh()
-        """
-        None
-        
     def _schedule_refresh(self):
         # Coalesce rapid per-track signals (thread pool) into a single table rebuild.
         if self._refresh_pending:
@@ -339,9 +364,9 @@ class LibraryView(QWidget):
         self.stop_btn.setEnabled(False)
         self.stop_btn.setVisible(False)
         self._set_status("Scan complete.")
-        if self._pending_folder:
-            self._register_scanned_folder(self._pending_folder)
-            self._pending_folder = None
+        for folder in self._pending_folders:
+            self._register_scanned_folder(folder)
+        self._pending_folders = []
         self.refresh_from_db()
         if self.on_library_changed:
             self.on_library_changed()
@@ -355,28 +380,79 @@ class LibraryView(QWidget):
             )).casefold()
             for track in self.tracks
         }
+        self._resolved_paths = {track.id: Path(track.filepath).resolve() for track in self.tracks}
+        self._duplicate_counts = {}
+        for track in self.tracks:
+            key = (track.artist.strip().casefold(), track.title.strip().casefold())
+            if any(key):
+                self._duplicate_counts[key] = self._duplicate_counts.get(key, 0) + 1
+        self._matched_query = ""
+        self._matched_folder = None
+        self._matched_tracks = []
         self.refresh_table()
 
     def refresh_table(self):
         query = self.search_edit.text().strip().casefold()
         folder_filter = self.folder_combo.currentData()
-        rows = self.tracks
+        if query != self._matched_query or folder_filter != self._matched_folder:
+            self._shown_count = self.PAGE_SIZE
+        rows = self._matched_tracks if (
+            query and query.startswith(self._matched_query)
+            and folder_filter == self._matched_folder
+        ) else self.tracks
         if folder_filter:
-            rows = [t for t in rows if is_within_folder(t.filepath, folder_filter)]
+            if rows is self.tracks:
+                folder_path = Path(folder_filter).resolve()
+                rows = [t for t in rows if self._resolved_paths[t.id].is_relative_to(folder_path)]
         if query:
             rows = [t for t in rows if query in self._search_cache.get(t.id, "")]
-        duplicate_counts = {}
-        for track in self.tracks:
-            key = (track.artist.strip().casefold(), track.title.strip().casefold())
-            if any(key):
-                duplicate_counts[key] = duplicate_counts.get(key, 0) + 1
+        column = self.table.horizontalHeader().sortIndicatorSection()
+        order = self.table.horizontalHeader().sortIndicatorOrder()
+        def sort_value(track):
+            if column == FAV_COL:
+                return track.favorite
+            if column == BPM_COL:
+                return track.tempo
+            if column == 8:
+                return track.energy
+            if column == 9:
+                return track.duration
+            if column == 10:
+                return track.added_at or ""
+            if column == 11:
+                return self._duplicate_counts.get((track.artist.strip().casefold(), track.title.strip().casefold()), 0)
+            return (track.title, track.artist, track.album, track.genre, track.key_name, track.camelot)[
+                {TITLE_COL: 0, 2: 1, 3: 2, 4: 3, 6: 4, 7: 5}.get(column, 0)
+            ].casefold()
+        rows = sorted(rows, key=sort_value, reverse=order == Qt.DescendingOrder)
+        self._matched_tracks = rows
+        self._matched_query = query
+        self._matched_folder = folder_filter
+        self._render_rows(rows[:self._shown_count])
+        self.more_btn.setVisible(len(rows) > self._shown_count)
+        self._set_status(f"Showing {min(len(rows), self._shown_count)} of {len(rows)} track(s)")
+
+    def _sort_changed(self, _column, _order):
+        self._shown_count = self.PAGE_SIZE
+        self.refresh_table()
+
+    def _load_more(self):
+        start = min(self._shown_count, len(self._matched_tracks))
+        self._shown_count += self.PAGE_SIZE
+        rows = self._matched_tracks
+        self._render_rows(rows[:self._shown_count], start=start)
+        self.more_btn.setVisible(len(rows) > self._shown_count)
+        self._set_status(f"Showing {min(len(rows), self._shown_count)} of {len(rows)} track(s)")
+
+    def _render_rows(self, rows, start=0):
         self.table.setSortingEnabled(False)
         self.table.setRowCount(len(rows))
-        for r, t in enumerate(rows):
+        for r in range(start, len(rows)):
+            t = rows[r]
             values = [
                 "", t.title, t.artist, t.album, t.genre, f"{t.tempo:.0f}", t.key_name,
                 t.camelot, f"{t.energy:.1f}", t.duration_str, (t.added_at or "")[:19].replace("T", " "),
-                str(duplicate_counts.get((t.artist.strip().casefold(), t.title.strip().casefold()), 0) or ""), "",
+                str(self._duplicate_counts.get((t.artist.strip().casefold(), t.title.strip().casefold()), 0) or ""), "",
             ]
             for c, val in enumerate(values):
                 if c == WAVEFORM_COL:
@@ -389,6 +465,10 @@ class LibraryView(QWidget):
                 elif c == BPM_COL:
                     item = NumericTableWidgetItem(val)
                     item.setData(Qt.UserRole, float(t.tempo))
+                elif c in (8, 9, 11):
+                    item = NumericTableWidgetItem(val)
+                    item.setData(Qt.UserRole, (t.energy if c == 8 else t.duration if c == 9 else
+                                                self._duplicate_counts.get((t.artist.strip().casefold(), t.title.strip().casefold()), 0)))
                 else:
                     item = QTableWidgetItem(val)
 
@@ -414,7 +494,6 @@ class LibraryView(QWidget):
             )
             self.table.setCellWidget(r, WAVEFORM_COL, waveform)
         self.table.setSortingEnabled(True)
-        self._set_status(f"{len(rows)} track(s) in library")
         self._apply_playing_marker()
 
     def get_row_ids(self) -> list[int]:
@@ -527,6 +606,20 @@ class LibraryView(QWidget):
             )
         self.waveform_dialog.load_track(track)
 
+    def _selected_track(self):
+        rows = self.table.selectionModel().selectedRows()
+        item = self.table.item(rows[0].row(), FAV_COL) if rows else None
+        return self.db.get_track(item.data(1000)) if item else None
+
+    def _update_explorer_button(self):
+        track = self._selected_track()
+        self.explorer_btn.setEnabled(bool(track and is_readable_file(track.filepath)))
+
+    def _show_selected_in_explorer(self):
+        track = self._selected_track()
+        if track:
+            show_in_file_explorer(track.filepath)
+
     def _show_context_menu(self, pos):
         row = self.table.rowAt(pos.y())
         if row < 0:
@@ -546,6 +639,8 @@ class LibraryView(QWidget):
         queue_action = menu.addAction(
             "Add Selected to Queue" if len(selected_rows) > 1 else "Add to Queue"
         )
+        explorer_action = menu.addAction("Show in File Explorer")
+        explorer_action.setEnabled(is_readable_file(track.filepath))
         menu.addSeparator()
         remove_action = menu.addAction("Remove from Library")
         chosen = menu.exec(self.table.viewport().mapToGlobal(pos))
@@ -557,6 +652,8 @@ class LibraryView(QWidget):
             self.refresh_from_db()
         elif chosen == waveform_action:
             self._show_waveform(track)
+        elif chosen == explorer_action:
+            show_in_file_explorer(track.filepath)
         elif chosen == queue_action and self.on_queue_track:
             selected_tracks = []
             for selected_row in selected_rows:

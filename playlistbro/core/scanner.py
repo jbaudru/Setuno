@@ -35,7 +35,7 @@ def is_within_folder(filepath: str, folder: str) -> bool:
 
 
 def scan_folder(
-    root_folder: str,
+    root_folder: str | list[str],
     db: Database,
     progress_cb: Optional[Callable[[int, int, str], None]] = None,
     track_cb: Optional[Callable[[Track], None]] = None,
@@ -50,11 +50,15 @@ def scan_folder(
     should_cancel() may return True to abort early.
     force=True re-analyzes every file, even ones already up to date in the library.
     """
-    files = list(find_audio_files(root_folder))
+    folders = [root_folder] if isinstance(root_folder, str) else root_folder
+    files = list(dict.fromkeys(
+        filepath for folder in folders for filepath in find_audio_files(folder)
+    ))
     existing = db.get_existing_filepaths()
     total = len(files)
     seen = set(files)
     done = 0
+    analyzed = 0
 
     to_analyze = []
     for filepath in files:
@@ -69,7 +73,7 @@ def scan_folder(
             continue
         to_analyze.append((filepath, filepath not in existing))
 
-    workers = max_workers or min(8, (os.cpu_count() or 4))
+    workers = max_workers or min(2, (os.cpu_count() or 2))
     if to_analyze:
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="analyze") as pool:
             futures = {
@@ -85,16 +89,38 @@ def scan_folder(
                 done += 1
                 try:
                     data = future.result()
+                    if (data.get("title") == Path(filepath).stem
+                            or not data.get("artist") or not data.get("album")):
+                        from .metadata_lookup import _parse_filename
+                        guessed = _parse_filename(Path(filepath))
+                        if data.get("title") == Path(filepath).stem and guessed["title"]:
+                            data["title"] = guessed["title"]
+                        for field in ("artist", "album"):
+                            if not data.get(field) and guessed[field]:
+                                data[field] = guessed[field]
                     if is_new and (
                         not data.get("artist")
                         or not data.get("album")
                         or not data.get("genre")
                         or not data.get("cover_path")
                     ):
+                        from .analyzer import _genre_from_folder, _read_tags
                         from .metadata_lookup import enrich_metadata
+                        genre_inferred = not (
+                            _read_tags(filepath).get("genre") or _genre_from_folder(filepath)
+                        )
+                        genre_guess = data.get("genre", "") if genre_inferred else ""
+                        if genre_inferred:
+                            data["genre"] = ""
                         data = enrich_metadata(data)
+                        data["genre"] = data.get("genre") or genre_guess
+                    from .metadata_lookup import write_missing_file_metadata
+                    if write_missing_file_metadata(filepath, data):
+                        stat = os.stat(filepath)
+                        data["mtime"] = stat.st_mtime
+                        data["filesize"] = stat.st_size
                     track_id = db.upsert_track(Track(**data))
-                    db.normalize_energy()
+                    analyzed += 1
                     if track_cb:
                         updated = db.get_track(track_id)
                         if updated:
@@ -106,5 +132,7 @@ def scan_folder(
                 if progress_cb:
                     progress_cb(done, total, Path(filepath).name)
 
+    if analyzed:
+        db.normalize_energy()
     db.remove_missing(seen | (set(existing) - set(files)))
 

@@ -332,9 +332,10 @@ class PlayerWidget(QWidget):
         self.waveform_chart.set_peaks(track.waveform_peaks)
         self.waveform_chart.set_playhead(None)
         self.waveform_chart.set_bpm(track.tempo)
+        self.waveform_chart.set_beat_offset(track.beat_offset)
         self.waveform_chart.set_duration(track.duration)
 
-        if self.waveform_chart.peaks:
+        if len(self.waveform_chart.peaks) >= 2400:
             return
 
         worker = _WaveformWorker(track.filepath)

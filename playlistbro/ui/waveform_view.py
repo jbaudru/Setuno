@@ -160,18 +160,19 @@ class MiniWaveform(QWidget):
         h = float(self.height())
         center = h / 2.0
 
-        values = self._normalize(self.peaks)
-        smooth = [
-            sum(values[max(0, i - 1):min(len(values), i + 2)]) / min(len(values), i + 2 - max(0, i - 1))
+        values = self._normalize(
+            _WaveformChart._resample(self.peaks, max(50, self.width() * 2))
+        )
+        low = [
+            sum(values[max(0, i - 2):min(len(values), i + 3)])
+            / (min(len(values), i + 3) - max(0, i - 2))
             for i in range(len(values))
         ]
-        low = smooth
-        high = [min(1.0, value * 0.48 + abs(raw - value) * 2.6) for raw, value in zip(values, smooth)]
 
         self._draw_waveform(
             painter,
-            low,
-            self.bass_color,
+            values,
+            self.treble_color,
             w,
             h * 0.43,
             center,
@@ -180,12 +181,12 @@ class MiniWaveform(QWidget):
 
         self._draw_waveform(
             painter,
-            high,
-            self.treble_color,
+            low,
+            self.bass_color,
             w,
             h * 0.43,
             center,
-            top_scale=0.72,
+            top_scale=0.68,
         )
 
         center_color = QColor(self.bg_color)
@@ -242,7 +243,7 @@ class _WaveformChart(QWidget):
         self.peaks = []
         self.bpm = None
         self.track_duration = None
-        self.beat_offset = 0.0
+        self.beat_offset = None
         self.playhead_time = None
 
         self.bass_color = QColor(bass_color)
@@ -300,9 +301,9 @@ class _WaveformChart(QWidget):
 
     def set_beat_offset(self, offset):
         try:
-            self.beat_offset = float(offset)
+            self.beat_offset = None if offset is None else float(offset)
         except (TypeError, ValueError):
-            self.beat_offset = 0.0
+            self.beat_offset = None
         self.update()
 
     def set_playhead(self, seconds):
@@ -467,6 +468,7 @@ class _WaveformChart(QWidget):
         if (
             not self.peaks
             or not self.bpm
+            or self.beat_offset is None
             or not self.track_duration
             or self.track_duration <= 0
         ):
@@ -504,9 +506,9 @@ class _WaveformChart(QWidget):
         # progressively denser (down to one label per beat) while zooming in.
         total_beats = max(1, last - first)
         px_per_beat = max(0.01, self.width() / total_beats)
-        min_label_spacing = fm.horizontalAdvance("00:00") + 10
+        min_label_spacing = fm.horizontalAdvance("000 | 00:00") + 12
 
-        label_stride = 1
+        label_stride = 4
         while px_per_beat * label_stride < min_label_spacing and label_stride < total_beats:
             label_stride *= 2
 
@@ -528,13 +530,16 @@ class _WaveformChart(QWidget):
             )
 
             is_bar = beat % 4 == 0
+            if not is_bar and px_per_beat < 8:
+                continue
 
-            color = QColor(self.treble_color)
+            light_background = self.bg_color.lightness() > 160
+            color = QColor("#263444") if light_background else QColor(self.treble_color)
             color.setAlpha(
-                80 if is_bar else 28
+                (220 if is_bar else 130) if light_background else (150 if is_bar else 55)
             )
 
-            painter.setPen(color)
+            painter.setPen(QPen(color, 1.4 if is_bar else 0.7))
 
             painter.drawLine(
                 int(x),
@@ -544,17 +549,15 @@ class _WaveformChart(QWidget):
             )
 
             # Timecode density adapts to the current zoom (see label_stride above).
-            if beat % label_stride == 0:
+            if is_bar and beat % label_stride == 0:
                 minutes = int(time // 60)
                 seconds = int(time % 60)
 
-                label = f"{minutes:02d}:{seconds:02d}"
+                label = f"{beat // 4 + 1} | {minutes:02d}:{seconds:02d}"
 
-                text_color = QColor(
-                    self.treble_color
-                )
+                text_color = QColor("#263444") if light_background else QColor(self.treble_color)
                 text_color.setAlpha(
-                    155 if is_bar else 90
+                    235 if light_background else (155 if is_bar else 90)
                 )
 
                 painter.setPen(text_color)
@@ -576,42 +579,21 @@ class _WaveformChart(QWidget):
         if end - start < 2:
             return
 
-        values = self._normalize(
-            self.peaks[start:end]
-        )
+        values = self._normalize(self.peaks)[start:end]
 
         if len(values) < 2:
             return
 
         # More detail as zoom increases (and a higher baseline than before
         # so the fully-zoomed-out view keeps sharp peaks too).
-        target = max(
-            400,
-            int(
-                self.width()
-                * (
-                    3.0
-                    + min(
-                        self.zoom_factor,
-                        32.0,
-                    ) * 1.0
-                )
-            ),
-        )
+        target = max(400, self.width() * 2)
 
         values = self._resample(
             values,
             target,
         )
 
-        # Only smooth when zoomed out.
-        if self.zoom_factor <= 1.5:
-            values = self._smooth(
-                values,
-                1,
-            )
-
-        low, high = self._split(values)
+        low = self._smooth(values, 2)
 
         n = len(values)
         if n < 2:
@@ -643,14 +625,14 @@ class _WaveformChart(QWidget):
 
         painter.setPen(Qt.NoPen)
 
-        painter.setBrush(self.bass_color)
-        painter.drawPath(
-            make_path(low, 0.92)
-        )
-
         painter.setBrush(self.treble_color)
         painter.drawPath(
-            make_path(high, 0.72)
+            make_path(values, 0.92)
+        )
+
+        painter.setBrush(self.bass_color)
+        painter.drawPath(
+            make_path(low, 0.68)
         )
 
         # Fine upper waveform detail.
@@ -659,12 +641,12 @@ class _WaveformChart(QWidget):
 
         path = QPainterPath()
 
-        for i, value in enumerate(high):
+        for i, value in enumerate(values):
             x = i * step
             y = (
                 center
                 - value
-                * 0.72
+                * 0.92
                 * height
                 * 0.78
             )
@@ -757,8 +739,6 @@ class _WaveformChart(QWidget):
             if not self.peaks:
                 return
 
-            self._draw_grid(painter)
-
             # Center line.
             center_color = QColor(
                 self.treble_color
@@ -781,6 +761,8 @@ class _WaveformChart(QWidget):
             self._draw_waveform(
                 painter
             )
+
+            self._draw_grid(painter)
 
             self._draw_playhead(
                 painter
@@ -1122,12 +1104,7 @@ class WaveformDialog(QDialog):
         self.chart.set_bpm(bpm)
         self.chart.set_duration(duration)
 
-        # Replace with your actual beat-grid offset if available.
-        beat_offset = getattr(
-            track,
-            "beat_offset",
-            0.0,
-        )
+        beat_offset = getattr(track, "beat_offset", None)
 
         self.chart.set_beat_offset(
             beat_offset
@@ -1135,7 +1112,7 @@ class WaveformDialog(QDialog):
 
         self.chart.set_peaks(getattr(track, "waveform_peaks", []))
 
-        if self.chart.peaks:
+        if len(self.chart.peaks) >= 2400:
             if not self.isVisible():
                 self.show()
             self.raise_()

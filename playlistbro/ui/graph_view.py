@@ -3,7 +3,7 @@ import math
 
 import numpy as np
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QColor, QBrush, QFont, QPainter, QPen
 from PySide6.QtWidgets import (
     QGraphicsEllipseItem, QGraphicsLineItem, QGraphicsScene, QGraphicsView, QHBoxLayout, QLabel,
@@ -17,32 +17,35 @@ from .icon_loader import cover_pixmap, icon
 
 
 class _GraphView(QGraphicsView):
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton and not isinstance(self.itemAt(event.pos()), _TrackNode):
+            self.parentWidget()._clear_highlight()
+        super().mousePressEvent(event)
+
     def wheelEvent(self, event):
         factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
         self.scale(factor, factor)
 
 
 class _TrackNode(QGraphicsEllipseItem):
-    def __init__(self, track: Track, callback, moved_callback, highlight_callback, queue_callback, *args):
+    def __init__(self, track: Track, callback, highlight_callback, queue_callback, *args):
         super().__init__(*args)
         self.track = track
         self.callback = callback
-        self.moved_callback = moved_callback
         self.highlight_callback = highlight_callback
         self.queue_callback = queue_callback
         self.setAcceptHoverEvents(True)
-        self.setFlag(QGraphicsEllipseItem.ItemIsMovable)
-        self.setFlag(QGraphicsEllipseItem.ItemSendsGeometryChanges)
         self.setToolTip(track.display_name)
 
     def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            self.callback(self.track)
-        super().mousePressEvent(event)
+        self._press_screen_pos = event.screenPos()
+        event.accept()
 
     def mouseReleaseEvent(self, event):
-        super().mouseReleaseEvent(event)
-        self.moved_callback()
+        event.accept()
+        if (event.button() == Qt.LeftButton
+            and (event.screenPos() - self._press_screen_pos).manhattanLength() < 6):
+            self.callback(self.track)
 
     def hoverEnterEvent(self, event):
         self.highlight_callback(self.track.id)
@@ -51,11 +54,6 @@ class _TrackNode(QGraphicsEllipseItem):
     def hoverLeaveEvent(self, event):
         self.highlight_callback(None)
         super().hoverLeaveEvent(event)
-
-    def itemChange(self, change, value):
-        if change == QGraphicsEllipseItem.ItemPositionHasChanged:
-            self.moved_callback()
-        return super().itemChange(change, value)
 
     def contextMenuEvent(self, event):
         menu = QMenu()
@@ -80,6 +78,11 @@ class SimilarityGraphView(QWidget):
         self._labels = {}
         self._edges = []
         self._selected_id = None
+        self._playing_id = None
+        self._pulse_phase = 0.0
+        self._pulse_timer = QTimer(self)
+        self._pulse_timer.setInterval(70)
+        self._pulse_timer.timeout.connect(self._pulse_playing)
         self._played_ids: set[int] = set()
         self._dirty = True
         self.scene = QGraphicsScene(self)
@@ -139,14 +142,14 @@ class SimilarityGraphView(QWidget):
             if score >= 42
         }
         cluster_by_id = self._clusters(displayed, edge_scores)
-        positions = self._cluster_positions(displayed, cluster_by_id)
+        positions = self._feature_positions(displayed)
         degree = {track.id: 0 for track in displayed}
         for first_id, second_id in edge_scores:
             degree[first_id] += 1
             degree[second_id] += 1
         for track in displayed:
             node_radius = 6 + min(12, degree[track.id] * 1.5)
-            node = _TrackNode(track, self._select_track, self._update_edges, self._highlight,
+            node = _TrackNode(track, self._select_track, self._highlight,
                               self.on_queue_track,
                               -node_radius, -node_radius, node_radius * 2, node_radius * 2)
             node.setPos(*positions[track.id])
@@ -175,9 +178,20 @@ class SimilarityGraphView(QWidget):
             self.scene.addItem(line)
             self._edges.append((first_id, second_id, score, line))
         self._update_edges()
+        bpm_axis = self.scene.addSimpleText("BPM  -->", QFont("Segoe UI", 9))
+        bpm_axis.setPos(min(x for x, _ in positions.values()), max(y for _, y in positions.values()) + 55)
+        energy_axis = self.scene.addSimpleText("Energy  ^", QFont("Segoe UI", 9))
+        energy_axis.setPos(min(x for x, _ in positions.values()) - 100, min(y for _, y in positions.values()) - 35)
         self.scene.setSceneRect(self.scene.itemsBoundingRect().adjusted(-100, -100, 100, 100))
         self._dirty = False
         self.reset_view()
+        self._selected_id = self._playing_id if self._playing_id in self._nodes else None
+        self._highlight(self._selected_id)
+        if self._selected_id is not None:
+            self._center_node(self._nodes[self._selected_id])
+            self._pulse_timer.start()
+        else:
+            self._pulse_timer.stop()
 
     @staticmethod
     def _nearest_candidates(tracks):
@@ -230,24 +244,20 @@ class SimilarityGraphView(QWidget):
         group_index = {group: index for index, group in enumerate(sorted(groups))}
         return {track.id: group_index[find(track.id)] for track in tracks}
 
-    def _cluster_positions(self, tracks, cluster_by_id):
-        groups = {}
-        for track in tracks:
-            groups.setdefault(cluster_by_id[track.id], []).append(track)
-        ordered_groups = sorted(groups.values(), key=lambda group: (-len(group), group[0].id))
+    def _feature_positions(self, tracks):
+        """Fixed axes: 8 scene units per BPM and 80 per energy point."""
         positions = {}
-        for group_index, group in enumerate(ordered_groups):
-            angle = group_index * 2.399963229728653
-            distance = 85 + 95 * math.sqrt(group_index)
-            center_x = math.cos(angle) * distance
-            center_y = math.sin(angle) * distance
-            for index, track in enumerate(sorted(group, key=lambda item: item.display_name.casefold())):
-                member_angle = index * 2.399963229728653
-                radius = 18 + 16 * math.sqrt(index)
-                positions[track.id] = (
-                    center_x + math.cos(member_angle) * radius,
-                    center_y + math.sin(member_angle) * radius,
-                )
+        duplicates = {}
+        for track in sorted(tracks, key=lambda item: item.id):
+            key = (float(track.tempo), float(track.energy))
+            index = duplicates.get(key, 0)
+            duplicates[key] = index + 1
+            angle = index * 2.399963229728653
+            offset = min(20, 10 * math.sqrt(index))
+            positions[track.id] = (
+                key[0] * 8 + math.cos(angle) * offset,
+                -key[1] * 80 + math.sin(angle) * offset,
+            )
         return positions
 
     def _update_edges(self):
@@ -275,6 +285,21 @@ class SimilarityGraphView(QWidget):
             color.setAlpha(255 if is_linked else (line.base_alpha if active_id is None else 12))
             line.setPen(QPen(color, line.base_width * (2.4 if is_linked else 1.0)))
             line.setZValue(-1)
+        self._pulse_playing()
+
+    def _clear_highlight(self):
+        self._selected_id = None
+        self._highlight(None)
+
+    def _pulse_playing(self):
+        node = self._nodes.get(self._playing_id)
+        if node is None:
+            return
+        self._pulse_phase += 0.18
+        pulse = (math.sin(self._pulse_phase) + 1) / 2
+        color = QColor("#38a169")
+        color.setAlpha(int(120 + 135 * pulse))
+        node.setPen(QPen(color, 2 + 3 * pulse))
 
     @staticmethod
     def _short_title(title: str) -> str:
@@ -282,8 +307,21 @@ class SimilarityGraphView(QWidget):
         return title if len(title) <= 12 else f"{title[:11]}..."
 
     def reset_view(self):
+        self.scene.setSceneRect(self.scene.itemsBoundingRect().adjusted(-100, -100, 100, 100))
         self.view.resetTransform()
         self.view.fitInView(self.scene.sceneRect(), Qt.KeepAspectRatio)
+
+    def _center_node(self, node):
+        scale = self.view.transform().m11()
+        if scale < 1.0:
+            self.view.scale(1.0 / scale, 1.0 / scale)
+        scale = self.view.transform().m11()
+        margin_x = self.view.viewport().width() / (2 * scale) + 30
+        margin_y = self.view.viewport().height() / (2 * scale) + 30
+        self.scene.setSceneRect(
+            self.scene.itemsBoundingRect().adjusted(-margin_x, -margin_y, margin_x, margin_y)
+        )
+        self.view.centerOn(node)
 
     def most_similar_neighbor(self, track_id: int):
         candidates = [
@@ -297,12 +335,14 @@ class SimilarityGraphView(QWidget):
         return self.db.get_track(neighbor_id)
 
     def set_playing_id(self, track_id: int | None):
+        self._playing_id = track_id
         self._selected_id = track_id if track_id in self._nodes else None
         self._highlight(self._selected_id)
+        self._pulse_timer.start() if self._selected_id is not None else self._pulse_timer.stop()
         if self._selected_id is not None:
             node = self._nodes[self._selected_id]
             self._show_track_details(node.track)
-            self.view.centerOn(node)
+            self._center_node(node)
 
     def set_played_ids(self, track_ids):
         self._played_ids = set(track_ids)
@@ -313,6 +353,7 @@ class SimilarityGraphView(QWidget):
         self._selected_id = track.id
         self._highlight(track.id)
         self._show_track_details(track)
+        self._center_node(self._nodes[track.id])
         if self.on_play_track:
             self.on_play_track(track)
 

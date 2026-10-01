@@ -1,8 +1,15 @@
 """Main application window: tabs, menu, embedded player docked at the bottom."""
-from PySide6.QtGui import QActionGroup, QPixmap
-from PySide6.QtWidgets import QApplication, QMainWindow, QMenu, QStatusBar, QSystemTrayIcon, QTabWidget, QVBoxLayout, QWidget, QDialog, QLabel, QPushButton, QHBoxLayout
-from PySide6.QtCore import Qt
+import json
+import re
+import sys
 
+from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
+from PySide6.QtGui import QActionGroup, QPixmap
+from PySide6.QtWidgets import QApplication, QMainWindow, QMenu, QMessageBox, QStatusBar, QSystemTrayIcon, QTabWidget, QVBoxLayout, QWidget, QDialog, QLabel, QPushButton, QHBoxLayout
+from PySide6.QtCore import QTimer, QUrl, QSize, Qt
+from PySide6.QtGui import QDesktopServices
+
+from .. import __version__
 from ..core.database import Database
 from ..core.settings import load_settings, save_settings
 from . import icon_loader
@@ -17,22 +24,40 @@ from .queue_view import QueueView
 from .theme import PALETTES, build_stylesheet, icon_color
 
 
+RELEASE_API = "https://api.github.com/repos/jbaudru/Setuno/releases/latest"
+RELEASES_URL = "https://github.com/jbaudru/Setuno/releases"
+
+
+def _new_release(payload: dict):
+    tag = payload.get("tag_name", "")
+    match = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", tag)
+    if not match or tuple(map(int, match.groups())) <= tuple(map(int, __version__.split("."))):
+        return None
+    assets = payload.get("assets") or []
+    installer = next((asset.get("browser_download_url", "") for asset in assets
+                      if asset.get("name", "").lower().startswith("setuno-setup-")
+                      and asset.get("name", "").lower().endswith(".exe")), "")
+    if not installer.startswith("https://github.com/jbaudru/Setuno/releases/download/"):
+        installer = RELEASES_URL
+    return tag, installer
+
+
 class QueueTabButton(QPushButton):
     def __init__(self, parent=None):
-        super().__init__("Queue", parent)
+        super().__init__(parent)
         self.setObjectName("queueTabButton")
         self.setCheckable(True)
-        self.setMinimumWidth(104)
+        self.setFixedSize(52, 36)
+        self.setIcon(icon_loader.icon("list"))
+        self.setIconSize(QSize(20, 20))
+        self.setToolTip("Queue")
+        self.setAccessibleName("Queue")
         self.badge = QLabel(self)
         self.badge.setObjectName("queueBadge")
         self.badge.setAlignment(Qt.AlignCenter)
         self.badge.setAttribute(Qt.WA_TransparentForMouseEvents)
-        self.badge.hide()
 
     def set_count(self, count: int):
-        if count <= 0:
-            self.badge.hide()
-            return
         self.badge.setText(str(count) if count < 100 else "99+")
         width = max(18, self.badge.fontMetrics().horizontalAdvance(self.badge.text()) + 8)
         self.badge.setFixedSize(width, 18)
@@ -44,7 +69,7 @@ class QueueTabButton(QPushButton):
         self._position_badge()
 
     def _position_badge(self):
-        self.badge.move(self.width() - self.badge.width() - 8, 3)
+        self.badge.move(self.width() - self.badge.width() - 2, 0)
 
 
 class MainWindow(QMainWindow):
@@ -61,7 +86,7 @@ class MainWindow(QMainWindow):
         self.played_track_ids = set()
         self._resume_source = None
         self._resume_track_id = None
-        self.theme = self.settings.get("theme", "dark")
+        self.theme = self.settings.get("theme", "light")
         icon_loader.set_theme_color(icon_color(self.theme))
         self.active_source: str | None = None  # 'library' or 'builder': where the current track came from
 
@@ -131,6 +156,7 @@ class MainWindow(QMainWindow):
         workspace.setSpacing(2)
         workspace.addWidget(self.tabs, 1)
         workspace.addWidget(self.level_meter)
+        self.level_meter.setVisible(bool(self.settings.get("show_level_meter", True)))
         workspace.setStretch(0, 1)
         workspace.setStretch(1, 0)
         layout.addLayout(workspace, 1)
@@ -140,7 +166,43 @@ class MainWindow(QMainWindow):
         self.setStatusBar(QStatusBar())
         self._build_menu()
         self._build_tray_controls()
+        self._taskbar_controls = None
+        if sys.platform == "win32":
+            from .windows_taskbar import WindowsTaskbarControls
+            self._taskbar_controls = WindowsTaskbarControls(
+                self, self._on_prev_requested, self.player.toggle_play, self._on_next_requested,
+            )
         self._apply_theme(self.theme, persist=False)
+        self._update_manager = QNetworkAccessManager(self)
+        QTimer.singleShot(0, self._check_for_updates)
+
+    def _check_for_updates(self):
+        request = QNetworkRequest(QUrl(RELEASE_API))
+        request.setRawHeader(b"User-Agent", b"Setuno")
+        request.setTransferTimeout(5000)
+        reply = self._update_manager.get(request)
+        reply.finished.connect(lambda: self._on_update_reply(reply))
+
+    def _on_update_reply(self, reply):
+        try:
+            if reply.error() != QNetworkReply.NetworkError.NoError:
+                return
+            release = _new_release(json.loads(bytes(reply.readAll())))
+            if not release:
+                return
+            tag, url = release
+            box = QMessageBox(self)
+            box.setWindowTitle("Setuno update available")
+            box.setText(f"Setuno {tag} is available (installed: {__version__}).")
+            download = box.addButton("Download", QMessageBox.AcceptRole)
+            box.addButton("Later", QMessageBox.RejectRole)
+            box.exec()
+            if box.clickedButton() is download:
+                QDesktopServices.openUrl(QUrl(url))
+        except (ValueError, TypeError, KeyError):
+            return
+        finally:
+            reply.deleteLater()
 
     def _build_menu(self):
         menu = self.menuBar().addMenu("&File")
@@ -151,15 +213,20 @@ class MainWindow(QMainWindow):
         exit_action.triggered.connect(self.close)
 
         view_menu = self.menuBar().addMenu("&View")
+        self.meter_action = view_menu.addAction("Show volume meter")
+        self.meter_action.setCheckable(True)
+        self.meter_action.setChecked(bool(self.settings.get("show_level_meter", True)))
+        self.meter_action.toggled.connect(self._set_level_meter_visible)
+        theme_menu = view_menu.addMenu("Theme")
         theme_group = QActionGroup(self)
         theme_group.setExclusive(True)
-        self.dark_action = view_menu.addAction("Dark theme")
+        self.dark_action = theme_menu.addAction("Dark")
         self.dark_action.setCheckable(True)
-        self.light_action = view_menu.addAction("Light theme")
+        self.light_action = theme_menu.addAction("Light")
         self.light_action.setCheckable(True)
-        self.rekordbox_action = view_menu.addAction("Rekordbox theme")
+        self.rekordbox_action = theme_menu.addAction("Rekordbox")
         self.rekordbox_action.setCheckable(True)
-        self.calm_action = view_menu.addAction("Calm theme")
+        self.calm_action = theme_menu.addAction("Calm")
         self.calm_action.setCheckable(True)
         theme_group.addAction(self.dark_action)
         theme_group.addAction(self.light_action)
@@ -212,12 +279,15 @@ class MainWindow(QMainWindow):
 
     def _update_tray_play_action(self, is_playing: bool):
         self.tray_play_action.setText("Pause" if is_playing else "Play")
+        if self._taskbar_controls:
+            self._taskbar_controls.set_playing(is_playing)
 
     def _apply_theme(self, mode: str, persist: bool = True):
         self.theme = mode
         palette = PALETTES[mode]
         QApplication.instance().setStyleSheet(build_stylesheet(mode))
         icon_loader.set_theme_color(palette["icon"])
+        self.queue_tab_btn.setIcon(icon_loader.icon("list"))
         self.library_view.apply_theme(palette["bg"], palette["accent_strong"], palette["accent"])
         self.playlist_builder.apply_theme(palette["bg"], palette["accent_strong"], palette["accent"])
         self.saved_playlists_view.apply_theme()
@@ -243,6 +313,11 @@ class MainWindow(QMainWindow):
         if persist:
             self.settings["theme"] = mode
             save_settings(self.settings)
+
+    def _set_level_meter_visible(self, visible: bool):
+        self.level_meter.setVisible(visible)
+        self.settings["show_level_meter"] = visible
+        save_settings(self.settings)
 
     def _on_tab_changed(self, index: int):
         self.queue_tab_btn.setChecked(self.tabs.widget(index) is self.queue_view)
@@ -313,7 +388,7 @@ class MainWindow(QMainWindow):
     def _mark_playing(self, track_id: int):
         self.library_view.set_playing_id(track_id if self.active_source == "library" else None)
         self.playlist_builder.set_playing_id(track_id if self.active_source == "builder" else None)
-        self.graph_view.set_playing_id(track_id if self.active_source == "graph" else None)
+        self.graph_view.set_playing_id(track_id)
 
     def _next_from_source(self, source, current_id):
         if source == "library":
@@ -411,7 +486,7 @@ class MainWindow(QMainWindow):
         # Description
         text = QLabel(
             "<h2>Setuno</h2>"
-            "<h3>v1.1.0</h3>"
+            f"<h3>v{__version__}</h3>"
             "<p>"
             "A local, offline companion for DJs, radio hosts, and playlist curators. "
             "It scans your music folders, analyzes each track's tempo, musical key and "

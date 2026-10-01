@@ -5,7 +5,8 @@ from pathlib import Path
 from .database import default_data_dir
 
 _DEFAULTS = {
-    "theme": "dark", "library_folders": [],
+    "theme": "light", "library_folders": [],
+    "show_level_meter": True,
     "library_visible_columns": None,
 }
 

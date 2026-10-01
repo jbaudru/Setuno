@@ -1,4 +1,4 @@
-<div align="center">
+, <div align="center">
   <img src="assets/icon.png" alt="Setuno icon" width="96" height="96" />
 
   # Setuno
@@ -8,13 +8,15 @@
   [![Latest release](https://img.shields.io/github/v/release/jbaudru/Setuno)](https://github.com/jbaudru/Setuno/releases/latest)
 </div>
 
-Setuno scans a music folder (recursively), analyzes each track's **tempo (BPM)**, **musical
+Setuno scans music folders (recursively), analyzes each track's **tempo (BPM)**, **musical
 key** (with Camelot wheel code for harmonic mixing), **energy**, and **genre**, then generates
 ordered playlists for a target set length or track count, with an embedded player, waveform
 view, live statistics, and export options. Everything runs locally and offline; your library
-never leaves your machine.
+never leaves your machine. At startup, Setuno checks GitHub for new releases when online.
 
 Created by **J. Baudru (Bonoob)**.
+
+Latest changes: [Setuno v1.2.1](CHANGELOG.md).
 
 ## Download
 
@@ -72,10 +74,11 @@ Choose from Setuno's dark presentation or the Rekordbox-inspired color scheme.
 ## Features
 
 - Recursive folder scan (`mp3`, `wav`, `flac`, `ogg`), analyzed in parallel with a thread pool
-- Automatic metadata: tempo, key (Camelot code), energy (1-10 normalized), and genre, classified
-  across 35+ styles from spectral/rhythmic descriptors, with `librosa`-backed tempo/key detection
-  when that optional dependency is installed
-- Tracks appear in the library live as each one finishes analyzing (no waiting for the full scan)
+- Automatic metadata: tempo, key (Camelot code), energy (1-10 normalized), and genre. Embedded
+  genre tags and recognized genre folders take priority over matched online metadata and the
+  heuristic spectral/rhythmic genre classifier. Tempo/key detection uses `librosa` when available;
+  silent audio is left without a guessed BPM, key, or genre
+- Newly scanned tracks appear in the library when the scan finishes
 - Favorites (heart a track) that are also weighted more likely to appear in generated playlists
 - Playlist generation modes:
   - **Fixed tempo**: consistent tempo band, ordered for harmonic (Camelot) compatibility
@@ -150,6 +153,12 @@ python -m PyInstaller --noconfirm build.spec
 ```
 
 `dist\Setuno.exe` is kept for release publishing; other transient build files remain ignored.
+Close Setuno before replacing that executable. If it is running, build a separate copy instead:
+
+```powershell
+python -m PyInstaller --noconfirm --distpath dist\preview build.spec
+# -> dist\preview\Setuno.exe
+```
 
 Optionally wrap it in a proper installer with [Inno Setup](https://jrsoftware.org/isinfo.php):
 
@@ -175,8 +184,9 @@ hdiutil create -volname "Setuno" -srcfolder dist/Setuno.app -ov -format UDZO dis
 
 ## Notes
 
-- The library is stored as plain JSON files under `data/library.json` and `data/playlists.json`,
-  next to `main.py` (or next to the app executable when built). No external database.
+- Library, playlists, settings, and covers are saved under `%LOCALAPPDATA%\Setuno\data`
+  on Windows or `~/Library/Application Support/Setuno/data` on macOS. Existing files next
+  to the old app are copied there on first run; the originals are kept. No external database.
 - Analysis of long tracks is capped to a ~90s representative window for speed; this keeps
   scanning fast while still giving reliable tempo/key/energy estimates.
 - Genre is read from existing ID3/Vorbis tags when present; otherwise it's classified by a

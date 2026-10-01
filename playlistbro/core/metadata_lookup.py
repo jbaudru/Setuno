@@ -207,7 +207,7 @@ DOWNLOAD_SUFFIX_PATTERN = re.compile(
     (?:
         \(\s*www\.[^)]+\s*\)
         |
-        \[\s*(?:www\.)?[^]]+\s*\]
+        \[\s*(?:www\.[^]]+|free\s+download|download|official(?:\s+(?:audio|video|music\s+video|full\s+stream))?|lyric\s+video)\s*\]
         |
         -\s*(?:download|youtube|official)
     )
@@ -216,12 +216,20 @@ DOWNLOAD_SUFFIX_PATTERN = re.compile(
     re.IGNORECASE | re.VERBOSE,
 )
 
+VIDEO_ID_SUFFIX_PATTERN = re.compile(r"\s*\[[A-Za-z0-9_-]{11}\]\s*$")
+RELEASE_LABEL_SUFFIX_PATTERN = re.compile(
+    r"\s*\[([^\]]+(?:records|recordings|release))\]\s*$",
+    re.IGNORECASE,
+)
+
 PAREN_NOISE_PATTERN = re.compile(
     r"""
     \s*
     \(
         (?:
             official(?:\s+(?:video|audio|lyric\s+video|music\s+video))?
+            |
+            official\s+full\s+stream
             |
             lyrics?
             |
@@ -293,6 +301,8 @@ def _strip_noise(text: str) -> str:
     """
     if not text:
         return ""
+
+    text = VIDEO_ID_SUFFIX_PATTERN.sub("", text)
 
     text = DOWNLOAD_SUFFIX_PATTERN.sub(
         "",
@@ -603,9 +613,12 @@ def _parse_filename(
         Artist, Artist - Title
         Artist_Track
     """
-    stem = _strip_noise(
-        path.stem
-    )
+    stem = VIDEO_ID_SUFFIX_PATTERN.sub("", path.stem)
+    suffix_label = RELEASE_LABEL_SUFFIX_PATTERN.search(stem)
+    album_fallback = _clean_text(suffix_label.group(1)) if suffix_label else ""
+    if suffix_label:
+        stem = stem[:suffix_label.start()]
+    stem = _strip_noise(stem)
 
     if not stem:
         return {
@@ -627,6 +640,10 @@ def _parse_filename(
     cleaned_stem, filename_label = (
         _extract_leading_label(stem)
     )
+    topic_artist = ""
+    if filename_label.lower().endswith(" - topic"):
+        topic_artist = _clean_artist_value(filename_label[:-8])
+        filename_label = ""
 
     parts = _split_filename_parts(
         cleaned_stem
@@ -726,7 +743,7 @@ def _parse_filename(
         # A detected filename label is a better fallback than nothing,
         # but the explicit Artist - Album - Title album takes priority.
         if not album:
-            album = filename_label
+            album = filename_label or album_fallback
 
         return {
             "artist": artist,
@@ -766,7 +783,7 @@ def _parse_filename(
 
         return {
             "artist": artist,
-            "album": filename_label or embedded_label,
+            "album": filename_label or embedded_label or album_fallback,
             "title": title,
         }
 
@@ -807,7 +824,7 @@ def _parse_filename(
 
         return {
             "artist": artist,
-            "album": filename_label or embedded_label,
+            "album": filename_label or embedded_label or album_fallback,
             "title": title,
         }
 
@@ -818,8 +835,8 @@ def _parse_filename(
     # ---------------------------------------------------------------
 
     return {
-        "artist": "",
-        "album": filename_label,
+        "artist": topic_artist,
+        "album": filename_label or album_fallback,
         "title": _remove_track_number(
             cleaned_stem
         ),
@@ -1944,6 +1961,63 @@ def _write_tags(
 
     except Exception:
         pass
+
+
+def write_missing_file_metadata(filepath: str, metadata: dict) -> bool:
+    """Embed only absent fields in supported audio formats."""
+    extension = Path(filepath).suffix.lower()
+    if extension not in {".mp3", ".wav", ".flac", ".ogg"}:
+        return False
+
+    try:
+        from mutagen import File as MutagenFile
+        audio = MutagenFile(filepath)
+        if audio is None:
+            return False
+        if audio.tags is None:
+            audio.add_tags()
+    except Exception:
+        return False
+
+    frames = {"title": ("TIT2", TIT2), "artist": ("TPE1", TPE1),
+              "album": ("TALB", TALB), "genre": ("TCON", TCON)}
+    changed = False
+    for field, (frame_id, frame_type) in frames.items():
+        value = _clean_text(metadata.get(field) or "")
+        if not value:
+            continue
+        if extension in {".mp3", ".wav"}:
+            existing = audio.tags.getall(frame_id)
+            if any(str(text).strip() for frame in existing for text in frame.text):
+                continue
+            audio.tags.delall(frame_id)
+            audio.tags.add(frame_type(encoding=3, text=value))
+        else:
+            if any(str(text).strip() for text in audio.get(field, [])):
+                continue
+            audio[field] = [value]
+        changed = True
+
+    if changed:
+        try:
+            audio.save()
+        except Exception:
+            return False
+
+    cover_path = metadata.get("cover_path")
+    if cover_path:
+        if extension in {".mp3", ".wav"}:
+            has_cover = bool(audio.tags.getall("APIC"))
+        elif extension == ".flac":
+            has_cover = bool(audio.pictures)
+        else:
+            has_cover = bool(audio.get("metadata_block_picture"))
+        if not has_cover:
+            from .analyzer import set_cover_art
+            if set_cover_art(filepath, cover_path):
+                changed = True
+
+    return changed
 
 
 # ===========================================================================

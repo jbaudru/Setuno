@@ -173,7 +173,7 @@ QTabBar::tab:selected {{
 QPushButton#queueTabButton {{
     background: {p['surface']};
     color: {p['muted_text']};
-    padding: 7px 30px 7px 14px;
+    padding: 0;
     border: 1px solid {p['border']};
     border-top-left-radius: 6px;
     border-top-right-radius: 6px;

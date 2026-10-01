@@ -23,12 +23,13 @@ from PySide6.QtWidgets import (
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
+    QToolButton,
     QVBoxLayout,
     QWidget,
     QGridLayout,
 )
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QBrush, QColor, QFont
 
 from ..core.database import Database
@@ -48,7 +49,7 @@ from ..core.relocator import find_missing, relocate_tracks
 from ..core.scanner import is_readable_file, is_within_folder
 
 from .icon_loader import icon, cover_pixmap
-from .library_view import ScanWorker
+from .library_view import ScanWorker, show_in_file_explorer
 from .profile_editor import ProfileEditorDialog
 from .stats_widget import StatsWidget
 from .track_edit import edit_bpm, edit_key, edit_metadata
@@ -113,11 +114,9 @@ class _ReorderableTable(QTableWidget):
         elif position.y() > self.visualRect(target_index).center().y():
             target_row += 1
         if track_ids and self._on_reordered:
-            self._on_reordered(track_ids, target_row)
-            # The callback rebuilt the complete table. Report CopyAction so Qt's
-            # internal-move cleanup does not delete the newly populated source cells.
             event.setDropAction(Qt.CopyAction)
             event.accept()
+            QTimer.singleShot(0, lambda: self._on_reordered(track_ids, target_row))
         else:
             event.ignore()
 
@@ -177,8 +176,12 @@ class PlaylistBuilder(QWidget):
         # ---------------------------------------------------------
 
         self.length_mode_combo = QComboBox()
+        self.length_mode_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.length_mode_combo.setMinimumContentsLength(10)
         self.length_mode_combo.addItem("Set length", "duration")
         self.length_mode_combo.addItem("Number of songs", "count")
+        self.length_mode_combo.setToolTip(self.length_mode_combo.currentText())
+        self.length_mode_combo.currentTextChanged.connect(self.length_mode_combo.setToolTip)
         self.length_mode_combo.currentIndexChanged.connect(
             self._update_field_modes
         )
@@ -196,10 +199,15 @@ class PlaylistBuilder(QWidget):
         self.count_spin.setButtonSymbols(QAbstractSpinBox.NoButtons)
 
         self.mode_combo = QComboBox()
+        self.mode_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.mode_combo.setMinimumContentsLength(10)
 
         for m in ALL_MODES:
             self.mode_combo.addItem(MODE_LABELS[m], m)
+            self.mode_combo.setItemData(self.mode_combo.count() - 1, MODE_LABELS[m], Qt.ToolTipRole)
 
+        self.mode_combo.setToolTip(self.mode_combo.currentText())
+        self.mode_combo.currentTextChanged.connect(self.mode_combo.setToolTip)
         self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
 
         # ---------------------------------------------------------
@@ -282,7 +290,11 @@ class PlaylistBuilder(QWidget):
         # ---------------------------------------------------------
 
         self.genre_combo = QComboBox()
+        self.genre_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.genre_combo.setMinimumContentsLength(8)
         self.genre_combo.addItem("All genres", None)
+        self.genre_combo.setToolTip(self.genre_combo.currentText())
+        self.genre_combo.currentTextChanged.connect(self.genre_combo.setToolTip)
 
         self.harmonic_check = QCheckBox("Harmonic mixing")
         self.harmonic_check.setChecked(True)
@@ -302,9 +314,9 @@ class PlaylistBuilder(QWidget):
         filters_box = QGroupBox("Playlist parameters")
 
         params = QGridLayout()
-        params.setContentsMargins(10, 8, 10, 8)
-        params.setHorizontalSpacing(10)
-        params.setVerticalSpacing(6)
+        params.setContentsMargins(8, 4, 8, 4)
+        params.setHorizontalSpacing(8)
+        params.setVerticalSpacing(3)
 
         # Target
         target_label = QLabel("Target")
@@ -321,7 +333,7 @@ class PlaylistBuilder(QWidget):
         target_widget.setLayout(target_layout)
 
         params.addWidget(target_label, 0, 0)
-        params.addWidget(target_widget, 0, 1, 1, 3)
+        params.addWidget(target_widget, 0, 1)
 
         # Matching
         matching_label = QLabel("Matching")
@@ -336,8 +348,8 @@ class PlaylistBuilder(QWidget):
         matching_widget = QWidget()
         matching_widget.setLayout(matching_layout)
 
-        params.addWidget(matching_label, 1, 0)
-        params.addWidget(matching_widget, 1, 1, 1, 3)
+        params.addWidget(matching_label, 0, 2)
+        params.addWidget(matching_widget, 0, 3)
 
         # Tempo
         tempo_label = QLabel("Tempo")
@@ -352,8 +364,8 @@ class PlaylistBuilder(QWidget):
         tempo_widget = QWidget()
         tempo_widget.setLayout(tempo_layout)
 
-        params.addWidget(tempo_label, 2, 0)
-        params.addWidget(tempo_widget, 2, 1, 1, 3)
+        params.addWidget(tempo_label, 1, 0)
+        params.addWidget(tempo_widget, 1, 1)
 
         # Energy
         energy_label = QLabel("Energy")
@@ -368,8 +380,8 @@ class PlaylistBuilder(QWidget):
         energy_widget = QWidget()
         energy_widget.setLayout(energy_layout)
 
-        params.addWidget(energy_label, 3, 0)
-        params.addWidget(energy_widget, 3, 1, 1, 3)
+        params.addWidget(energy_label, 1, 2)
+        params.addWidget(energy_widget, 1, 3)
 
         # Bottom options + Generate
         options_layout = QHBoxLayout()
@@ -380,8 +392,9 @@ class PlaylistBuilder(QWidget):
         options_layout.addWidget(self.edit_profile_btn)
         options_layout.addStretch()
 
-        self.generate_btn.setMinimumHeight(32)
-        self.generate_btn.setMinimumWidth(110)
+        self.generate_btn.setMinimumHeight(28)
+        self.generate_btn.setMinimumWidth(92)
+        self.generate_btn.setStyleSheet("padding: 3px 14px;")
         self.generate_btn.setSizePolicy(
             QSizePolicy.Fixed,
             QSizePolicy.Fixed,
@@ -392,11 +405,11 @@ class PlaylistBuilder(QWidget):
         options_widget = QWidget()
         options_widget.setLayout(options_layout)
 
-        params.addWidget(options_widget, 4, 0, 1, 4)
+        params.addWidget(options_widget, 2, 0, 1, 4)
 
-        params.setColumnMinimumWidth(0, 75)
+        params.setColumnMinimumWidth(0, 55)
+        params.setColumnMinimumWidth(2, 65)
         params.setColumnStretch(1, 1)
-        params.setColumnStretch(2, 1)
         params.setColumnStretch(3, 1)
 
         filters_box.setLayout(params)
@@ -430,6 +443,7 @@ class PlaylistBuilder(QWidget):
         self.table.customContextMenuRequested.connect(
             self._show_context_menu
         )
+        self.table.itemSelectionChanged.connect(self._update_explorer_button)
 
         # ---------------------------------------------------------
         # Export / save controls
@@ -445,6 +459,12 @@ class PlaylistBuilder(QWidget):
 
         self.save_library_btn = QPushButton(" Save to library")
         self.save_library_btn.setIcon(icon("star"))
+
+        self.explorer_btn = QToolButton()
+        self.explorer_btn.setIcon(icon("folder"))
+        self.explorer_btn.setToolTip("Show selected song in File Explorer")
+        self.explorer_btn.setEnabled(False)
+        self.explorer_btn.clicked.connect(self._show_selected_in_explorer)
 
         for b in (
             self.save_m3u_btn,
@@ -462,6 +482,7 @@ class PlaylistBuilder(QWidget):
         actions.addWidget(self.export_folder_btn)
         actions.addWidget(self.save_library_btn)
         actions.addStretch()
+        actions.addWidget(self.explorer_btn)
 
         results_box = QVBoxLayout()
         results_box.addWidget(self.table)
@@ -598,6 +619,7 @@ class PlaylistBuilder(QWidget):
         self.genre_combo.addItem("All genres", None)
         for g in genres:
             self.genre_combo.addItem(g, g)
+            self.genre_combo.setItemData(self.genre_combo.count() - 1, g, Qt.ToolTipRole)
 
     def _choose_folder_filter(self):
         folder = QFileDialog.getExistingDirectory(self, "Select folder to build the playlist from")
@@ -847,6 +869,20 @@ class PlaylistBuilder(QWidget):
             self.waveform_dialog = WaveformDialog(self)
         self.waveform_dialog.load_track(track)
 
+    def _selected_track(self):
+        rows = self.table.selectionModel().selectedRows()
+        item = self.table.item(rows[0].row(), KEEP_COL) if rows else None
+        return next((track for track in self.current_playlist if track.id == item.data(1000)), None) if item else None
+
+    def _update_explorer_button(self):
+        track = self._selected_track()
+        self.explorer_btn.setEnabled(bool(track and is_readable_file(track.filepath)))
+
+    def _show_selected_in_explorer(self):
+        track = self._selected_track()
+        if track:
+            show_in_file_explorer(track.filepath)
+
     def _show_context_menu(self, pos):
         row = self.table.rowAt(pos.y())
         if row < 0 or row >= len(self.current_playlist):
@@ -863,6 +899,8 @@ class PlaylistBuilder(QWidget):
         queue_action = menu.addAction(
             "Add Selected to Queue" if len(selected_rows) > 1 else "Add to Queue"
         )
+        explorer_action = menu.addAction("Show in File Explorer")
+        explorer_action.setEnabled(is_readable_file(track.filepath))
         menu.addSeparator()
         remove_action = menu.addAction("Remove from Library")
         chosen = menu.exec(self.table.viewport().mapToGlobal(pos))
@@ -883,6 +921,8 @@ class PlaylistBuilder(QWidget):
                 self._populate_table(self.current_playlist)
         elif chosen == waveform_action:
             self._show_waveform(track)
+        elif chosen == explorer_action:
+            show_in_file_explorer(track.filepath)
         elif chosen == queue_action and self.on_queue_track:
             id_to_track = {item.id: item for item in self.current_playlist}
             selected_tracks = []
