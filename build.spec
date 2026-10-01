@@ -51,7 +51,7 @@ if sys.platform == "darwin":
         info_plist={
             "CFBundleName": "Setuno",
             "CFBundleDisplayName": "Setuno",
-            "CFBundleShortVersionString": "1.2.1",
+            "CFBundleShortVersionString": "1.2.2",
             "NSHighResolutionCapable": True,
         },
     )

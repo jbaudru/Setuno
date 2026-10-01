@@ -8,7 +8,8 @@ from PySide6.QtCore import QProcess, QThread, QTimer, Qt, Signal
 from PySide6.QtGui import QBrush, QColor
 from PySide6.QtWidgets import (
     QAbstractItemView, QComboBox, QDialog, QFileDialog, QHBoxLayout, QHeaderView, QLabel,
-    QLineEdit, QListView, QListWidget, QMenu, QMessageBox, QProgressBar, QPushButton, QTableWidget,
+    QLineEdit, QListView, QListWidget, QMenu, QMessageBox, QProgressBar, QPushButton, QStyledItemDelegate,
+    QTableWidget,
     QTableWidgetItem, QToolButton, QTreeView, QVBoxLayout, QWidget,
 )
 
@@ -17,7 +18,7 @@ from ..core.scanner import is_readable_file, scan_folder, is_within_folder
 from ..core.models import Track
 from .icon_loader import icon, cover_pixmap
 from .track_edit import edit_bpm, edit_key, edit_metadata
-from .waveform_view import MiniWaveform, WaveformDialog
+from .waveform_view import MiniWaveformDelegate, WaveformDialog, reduce_peaks
 
 COLUMNS = ["\u2665", "Title", "Artist", "Album", "Genre", "BPM", "Key", "Camelot", "Energy", "Duration", "Added", "Duplicates", "Waveform"]
 FAV_COL = 0
@@ -43,6 +44,42 @@ class NumericTableWidgetItem(QTableWidgetItem):
             return float(self.data(Qt.UserRole)) < float(other.data(Qt.UserRole))
         except (TypeError, ValueError):
             return super().__lt__(other)
+
+
+FAV_ROLE = Qt.UserRole + 3
+
+
+def heart_icon(favorite: bool):
+    return icon("heart", FAVORITE_COLOR) if favorite else icon("heart-outline")
+
+
+def set_favorite_item(item: QTableWidgetItem, favorite: bool):
+    item.setText("")
+    item.setData(FAV_ROLE, bool(favorite))
+    item.setData(Qt.UserRole, int(bool(favorite)))
+    item.setToolTip("Remove from favorites" if favorite else "Add to favorites")
+
+
+def make_favorite_item(favorite: bool) -> QTableWidgetItem:
+    item = NumericTableWidgetItem("")
+    set_favorite_item(item, favorite)
+    return item
+
+
+class FavoriteDelegate(QStyledItemDelegate):
+    """Paints a centered heart (filled red when favorite) in the favorite column."""
+
+    SIZE = 14
+
+    def paint(self, painter, option, index):
+        super().paint(painter, option, index)
+        favorite = index.data(FAV_ROLE)
+        if favorite is None:
+            return
+        rect = option.rect
+        x = rect.x() + (rect.width() - self.SIZE) // 2
+        y = rect.y() + (rect.height() - self.SIZE) // 2
+        heart_icon(bool(favorite)).paint(painter, x, y, self.SIZE, self.SIZE)
 
 class _FolderManagerDialog(QDialog):
     """Lets the user drop folders from the multi-folder library (tracks stay in place on disk)."""
@@ -110,7 +147,6 @@ class ScanWorker(QThread):
 
 class LibraryView(QWidget):
     STATUS_MAX_WIDTH = 400  # cap how much horizontal space the status text can claim
-    PAGE_SIZE = 200
 
     def __init__(
         self, db: Database, on_library_changed=None, on_play_track=None,
@@ -125,6 +161,7 @@ class LibraryView(QWidget):
         self.set_library_folders = set_library_folders or (lambda folders: None)
         self.on_queue_track = on_queue_track
         self.is_track_played = is_track_played or (lambda _track_id: False)
+        self.on_favorite_changed = None
         self.get_visible_columns = get_visible_columns or (lambda: None)
         self.set_visible_columns = set_visible_columns or (lambda _columns: None)
         self.tracks: list[Track] = []
@@ -134,7 +171,8 @@ class LibraryView(QWidget):
         self._matched_tracks: list[Track] = []
         self._matched_query = ""
         self._matched_folder = None
-        self._shown_count = self.PAGE_SIZE
+        self._readable: dict[int, bool] = {}
+        self._mini_peaks: dict[int, tuple] = {}
         self.worker: ScanWorker | None = None
         self._refresh_pending = False
         self._pending_folders: list[str] = []
@@ -190,9 +228,6 @@ class LibraryView(QWidget):
         self.explorer_btn.clicked.connect(self._show_selected_in_explorer)
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
-        self.more_btn = QPushButton("Load more")
-        self.more_btn.setVisible(False)
-        self.more_btn.clicked.connect(self._load_more)
 
         top = QHBoxLayout()
         top.addWidget(self.scan_btn)
@@ -209,8 +244,13 @@ class LibraryView(QWidget):
         self.table.setAlternatingRowColors(True)
         self.table.setSortingEnabled(True)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.table.horizontalHeader().setSortIndicator(TITLE_COL, Qt.AscendingOrder)
         self.table.horizontalHeader().sortIndicatorChanged.connect(self._sort_changed)
+        self._fav_delegate = FavoriteDelegate(self.table)
+        self.table.setItemDelegateForColumn(FAV_COL, self._fav_delegate)
         self.table.horizontalHeader().setStretchLastSection(True)
+        self._wave_delegate = MiniWaveformDelegate(self._wave_bass, self._wave_treble, self._wave_bg, self.table)
+        self.table.setItemDelegateForColumn(WAVEFORM_COL, self._wave_delegate)
         for col, width in enumerate([30, 220, 100, 100, 100, 60, 70, 70, 70, 100, 145, 75]):
             self.table.setColumnWidth(col, width)
         for column, action in enumerate(self._column_actions):
@@ -231,7 +271,6 @@ class LibraryView(QWidget):
         status_row.addWidget(self.columns_btn)
         layout.addLayout(status_row)
         layout.addWidget(self.table)
-        layout.addWidget(self.more_btn)
 
         self.scan_btn.clicked.connect(self.choose_folder)
         self.stop_btn.clicked.connect(self.stop_scan)
@@ -381,6 +420,10 @@ class LibraryView(QWidget):
             for track in self.tracks
         }
         self._resolved_paths = {track.id: Path(track.filepath).resolve() for track in self.tracks}
+        self._readable = {track.id: is_readable_file(track.filepath) for track in self.tracks}
+        self._mini_peaks = {
+            track.id: reduce_peaks(track.waveform_peaks or track.waveform_low) for track in self.tracks
+        }
         self._duplicate_counts = {}
         for track in self.tracks:
             key = (track.artist.strip().casefold(), track.title.strip().casefold())
@@ -394,8 +437,6 @@ class LibraryView(QWidget):
     def refresh_table(self):
         query = self.search_edit.text().strip().casefold()
         folder_filter = self.folder_combo.currentData()
-        if query != self._matched_query or folder_filter != self._matched_folder:
-            self._shown_count = self.PAGE_SIZE
         rows = self._matched_tracks if (
             query and query.startswith(self._matched_query)
             and folder_filter == self._matched_folder
@@ -428,26 +469,17 @@ class LibraryView(QWidget):
         self._matched_tracks = rows
         self._matched_query = query
         self._matched_folder = folder_filter
-        self._render_rows(rows[:self._shown_count])
-        self.more_btn.setVisible(len(rows) > self._shown_count)
-        self._set_status(f"Showing {min(len(rows), self._shown_count)} of {len(rows)} track(s)")
+        self._render_rows(rows)
+        self._set_status(f"Showing {len(rows)} track(s)")
 
     def _sort_changed(self, _column, _order):
-        self._shown_count = self.PAGE_SIZE
         self.refresh_table()
 
-    def _load_more(self):
-        start = min(self._shown_count, len(self._matched_tracks))
-        self._shown_count += self.PAGE_SIZE
-        rows = self._matched_tracks
-        self._render_rows(rows[:self._shown_count], start=start)
-        self.more_btn.setVisible(len(rows) > self._shown_count)
-        self._set_status(f"Showing {min(len(rows), self._shown_count)} of {len(rows)} track(s)")
-
-    def _render_rows(self, rows, start=0):
+    def _render_rows(self, rows):
+        self.table.setUpdatesEnabled(False)
         self.table.setSortingEnabled(False)
         self.table.setRowCount(len(rows))
-        for r in range(start, len(rows)):
+        for r in range(len(rows)):
             t = rows[r]
             values = [
                 "", t.title, t.artist, t.album, t.genre, f"{t.tempo:.0f}", t.key_name,
@@ -459,9 +491,7 @@ class LibraryView(QWidget):
                     continue
 
                 if c == FAV_COL:
-                    item = QTableWidgetItem("\u2665" if t.favorite else "\u2661")
-                    item.setForeground(QBrush(QColor(FAVORITE_COLOR if t.favorite else UNFAVORITE_COLOR)))
-                    item.setTextAlignment(Qt.AlignCenter)
+                    item = make_favorite_item(t.favorite)
                 elif c == BPM_COL:
                     item = NumericTableWidgetItem(val)
                     item.setData(Qt.UserRole, float(t.tempo))
@@ -481,19 +511,17 @@ class LibraryView(QWidget):
                     item.setIcon(cover_pixmap(t.cover_path, 24))
                     if self.is_track_played(t.id):
                         item.setForeground(QBrush(QColor(PLAYED_COLOR)))
-                    elif not is_readable_file(t.filepath):
+                    elif not self._readable.get(t.id, True):
                         item.setForeground(QBrush(QColor(UNAVAILABLE_COLOR)))
 
                 self.table.setItem(r, c, item)
             id_item = QTableWidgetItem("")
             id_item.setData(1000, t.id)
+            id_item.setData(MiniWaveformDelegate.PEAKS_ROLE, self._mini_peaks.get(t.id, ()))
+            id_item.setToolTip("Click to open the full waveform")
             self.table.setItem(r, WAVEFORM_COL, id_item)
-            waveform = MiniWaveform(
-                t.waveform_peaks or t.waveform_low, self._wave_bass, self._wave_treble, self._wave_bg,
-                on_clicked=lambda track=t: self._show_waveform(track),
-            )
-            self.table.setCellWidget(r, WAVEFORM_COL, waveform)
         self.table.setSortingEnabled(True)
+        self.table.setUpdatesEnabled(True)
         self._apply_playing_marker()
 
     def get_row_ids(self) -> list[int]:
@@ -537,7 +565,7 @@ class LibraryView(QWidget):
             track = tracks.get(id_item.data(1000))
             if self.is_track_played(id_item.data(1000)):
                 title_item.setForeground(QBrush(QColor(PLAYED_COLOR)))
-            elif track and not is_readable_file(track.filepath):
+            elif track and not self._readable.get(track.id, True):
                 title_item.setForeground(QBrush(QColor(UNAVAILABLE_COLOR)))
             else:
                 title_item.setForeground(QBrush())
@@ -583,6 +611,12 @@ class LibraryView(QWidget):
         self.play_row(self.table.currentRow())
 
     def _on_cell_clicked(self, row: int, col: int):
+        if col == WAVEFORM_COL:
+            item = self.table.item(row, WAVEFORM_COL)
+            track = self.db.get_track(item.data(1000)) if item else None
+            if track:
+                self._show_waveform(track)
+            return
         if col != FAV_COL:
             return
         item = self.table.item(row, FAV_COL)
@@ -594,8 +628,18 @@ class LibraryView(QWidget):
             return
         track.favorite = not track.favorite
         self.db.set_favorite(track_id, track.favorite)
-        item.setText("\u2665" if track.favorite else "\u2661")
-        item.setForeground(QBrush(QColor(FAVORITE_COLOR if track.favorite else UNFAVORITE_COLOR)))
+        set_favorite_item(item, track.favorite)
+        if self.on_favorite_changed:
+            self.on_favorite_changed(track_id, track.favorite)
+
+    def set_favorite_state(self, track_id: int, favorite: bool):
+        for track in self.tracks:
+            if track.id == track_id:
+                track.favorite = favorite
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, FAV_COL)
+            if item and item.data(1000) == track_id:
+                set_favorite_item(item, favorite)
 
     def _show_waveform(self, track: Track):
         if self.waveform_dialog is None:
@@ -699,7 +743,5 @@ class LibraryView(QWidget):
         self.columns_btn.setIcon(icon("columns"))
         if bg and bass and treble:
             self._wave_bg, self._wave_bass, self._wave_treble = bg, bass, treble
-            for r in range(self.table.rowCount()):
-                widget = self.table.cellWidget(r, WAVEFORM_COL)
-                if isinstance(widget, MiniWaveform):
-                    widget.set_theme(bass, treble, bg)
+            self._wave_delegate.set_theme(bass, treble, bg)
+            self.table.viewport().update()

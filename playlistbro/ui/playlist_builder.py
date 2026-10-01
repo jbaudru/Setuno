@@ -49,7 +49,9 @@ from ..core.relocator import find_missing, relocate_tracks
 from ..core.scanner import is_readable_file, is_within_folder
 
 from .icon_loader import icon, cover_pixmap
-from .library_view import ScanWorker, show_in_file_explorer
+from .library_view import (
+    FavoriteDelegate, ScanWorker, make_favorite_item, set_favorite_item, show_in_file_explorer,
+)
 from .profile_editor import ProfileEditorDialog
 from .stats_widget import StatsWidget
 from .track_edit import edit_bpm, edit_key, edit_metadata
@@ -139,6 +141,7 @@ class PlaylistBuilder(QWidget):
         self.on_library_changed = on_library_changed
         self.on_queue_track = on_queue_track
         self.is_track_played = is_track_played or (lambda _track_id: False)
+        self.on_favorite_changed = None
 
         self.current_playlist = []
         self.folder_filter: str | None = None
@@ -434,6 +437,7 @@ class PlaylistBuilder(QWidget):
         self.table.horizontalHeader().setStretchLastSection(True)
         for col, width in enumerate([40, 30, 40, 220, 100, 60, 100, 70, 70, 70]):
             self.table.setColumnWidth(col, width)
+        self.table.setItemDelegateForColumn(FAV_COL, FavoriteDelegate(self.table))
         
         self.table.doubleClicked.connect(self._play_selected)
         self.table.itemChanged.connect(self._on_item_changed)
@@ -714,9 +718,7 @@ class PlaylistBuilder(QWidget):
                         Qt.Checked if t.id in self._locked_ids else Qt.Unchecked
                     )
                 elif c == FAV_COL:
-                    item = QTableWidgetItem("\u2665" if t.favorite else "\u2661")
-                    item.setForeground(QBrush(QColor(FAVORITE_COLOR if t.favorite else UNFAVORITE_COLOR)))
-                    item.setTextAlignment(Qt.AlignCenter)
+                    item = make_favorite_item(t.favorite)
                 else:
                     item = QTableWidgetItem(val)
                 item.setData(1000, t.id)
@@ -756,8 +758,18 @@ class PlaylistBuilder(QWidget):
         track = self.current_playlist[row]
         track.favorite = not track.favorite
         self.db.set_favorite(track.id, track.favorite)
-        item.setText("\u2665" if track.favorite else "\u2661")
-        item.setForeground(QBrush(QColor(FAVORITE_COLOR if track.favorite else UNFAVORITE_COLOR)))
+        set_favorite_item(item, track.favorite)
+        if self.on_favorite_changed:
+            self.on_favorite_changed(track.id, track.favorite)
+
+    def set_favorite_state(self, track_id: int, favorite: bool):
+        for row, track in enumerate(self.current_playlist):
+            if track.id != track_id:
+                continue
+            track.favorite = favorite
+            item = self.table.item(row, FAV_COL)
+            if item:
+                set_favorite_item(item, favorite)
 
     def get_row_ids(self) -> list[int]:
         """Track ids in the current on-screen row order."""

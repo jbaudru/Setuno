@@ -25,19 +25,18 @@ class LibrarySearchTests(unittest.TestCase):
         view = LibraryView(db)
         self.addCleanup(view.close)
 
-        self.assertEqual(view.table.rowCount(), 200)
+        self.assertEqual(view.table.rowCount(), 450)
         view.table.sortItems(8, Qt.DescendingOrder)
         self.assertEqual(view.get_row_ids()[0], 450)
-        view._load_more()
-        self.assertEqual(len(set(view.get_row_ids())), 400)
+        self.assertEqual(len(set(view.get_row_ids())), 450)
 
         view.search_edit.setText("mix 44")
         view.refresh_table()
         self.assertEqual(view.table.rowCount(), 11)
         view.search_edit.setText("mix")
         view.refresh_table()
-        self.assertEqual(view.table.rowCount(), 200)
-        self.assertFalse(view.more_btn.isHidden())
+        self.assertEqual(view.table.rowCount(), 450)
+        self.assertFalse(hasattr(view, "more_btn"))
 
 
 if __name__ == "__main__":

@@ -12,6 +12,19 @@ from ..core.playlist_engine import playlist_stats
 
 Y_TICKS = 4
 
+_HUE_STEPS = (0, 16, -16, 32, -32, 48, -48)
+_LIGHT_STEPS = (0, -40, 40)
+
+
+def palette_shade(accent: QColor, index: int) -> QColor:
+    """A color close to the theme accent: small hue and lightness steps around it."""
+    hue = max(0, accent.hslHue())
+    sat = max(60, accent.hslSaturation())
+    light = min(200, max(70, accent.lightness()))
+    hue = (hue + _HUE_STEPS[index % len(_HUE_STEPS)]) % 360
+    light += _LIGHT_STEPS[(index // len(_HUE_STEPS)) % len(_LIGHT_STEPS)]
+    return QColor.fromHsl(hue, sat, min(215, max(55, light)))
+
 
 class _CurveChart(QWidget):
     """Simple line/bar chart for a single numeric series, with axis ticks and value labels."""
@@ -260,8 +273,7 @@ class _GenrePie(QWidget):
         colors = []
         for i, (name, count) in enumerate(self.genres.items()):
             span = -int(360 * 16 * (count / total))
-            color = QColor.fromHsv((max(0, self.accent_color.hue()) + i * 53) % 360,
-                                   150 + (i % 3) * 20, 210)
+            color = palette_shade(self.accent_color, i)
             colors.append(color)
             painter.setBrush(color)
             painter.setPen(QPen(self.title_color, 2) if i == self.hovered_genre else Qt.NoPen)
@@ -356,7 +368,7 @@ class StatsWidget(QWidget):
         self.tempo_chart.set_color(accent)
         self.energy_chart.set_theme(bg, axis, title)
         energy_color = QColor(accent)
-        energy_color.setHsv((max(0, energy_color.hue()) + 150) % 360, 175, 190)
+        energy_color = energy_color.darker(135) if QColor(bg).lightness() > 140 else energy_color.lighter(125)
         self.energy_chart.set_color(energy_color.name())
         self.genre_chart.set_theme(bg, title, accent)
         self.summary_label.setStyleSheet(f"color: {accent}; font-weight: bold;")

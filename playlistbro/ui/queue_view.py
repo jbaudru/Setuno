@@ -10,8 +10,8 @@ from ..core.database import Database
 from ..core.scanner import is_readable_file
 from .icon_loader import cover_pixmap, icon
 from .library_view import (
-    BPM_COL, COLUMNS, FAV_COL, FAVORITE_COLOR, NumericTableWidgetItem,
-    TITLE_COL, UNAVAILABLE_COLOR, UNFAVORITE_COLOR, WAVEFORM_COL, show_in_file_explorer,
+    BPM_COL, COLUMNS, FAV_COL, FavoriteDelegate, NumericTableWidgetItem,
+    TITLE_COL, UNAVAILABLE_COLOR, WAVEFORM_COL, make_favorite_item, show_in_file_explorer,
 )
 from .waveform_view import MiniWaveform
 
@@ -58,6 +58,7 @@ class QueueView(QWidget):
         self.table.itemSelectionChanged.connect(self._update_explorer_button)
         for column, width in enumerate([30, 220, 100, 100, 100, 60, 70, 70, 70, 100, 145, 75]):
             self.table.setColumnWidth(column, width)
+        self.table.setItemDelegateForColumn(FAV_COL, FavoriteDelegate(self.table))
 
         layout = QVBoxLayout(self)
         layout.addLayout(controls)
@@ -146,9 +147,7 @@ class QueueView(QWidget):
                 if column == WAVEFORM_COL:
                     continue
                 if column == FAV_COL:
-                    item = QTableWidgetItem("\u2665" if track.favorite else "\u2661")
-                    item.setForeground(QBrush(QColor(FAVORITE_COLOR if track.favorite else UNFAVORITE_COLOR)))
-                    item.setTextAlignment(Qt.AlignCenter)
+                    item = make_favorite_item(track.favorite)
                 elif column == BPM_COL:
                     item = NumericTableWidgetItem(value)
                     item.setData(Qt.UserRole, float(track.tempo))

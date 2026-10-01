@@ -3,7 +3,7 @@ import math
 
 import numpy as np
 
-from PySide6.QtCore import Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import QSize, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QFontMetrics
 from PySide6.QtMultimedia import QAudioBufferOutput, QAudioFormat, QAudioOutput, QMediaPlayer
 from PySide6.QtWidgets import (
@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
 
 from ..core.models import Track
 from .icon_loader import cover_pixmap, icon
+from .library_view import heart_icon
 from .waveform_view import _WaveformChart, _WaveformWorker
 
 WAVEFORM_HEIGHT = 120
@@ -96,6 +97,7 @@ class PlayerWidget(QWidget):
     track_transitioned = Signal(object)
     playing_changed = Signal(bool)
     audio_levels_changed = Signal(float, float)
+    favorite_toggled = Signal(object)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -161,6 +163,15 @@ class PlayerWidget(QWidget):
         self.next_btn.setIcon(icon("next"))
         self.next_btn.setFlat(True)
         self.next_btn.setFixedSize(28, 28)
+        self.like_btn = QPushButton()
+        self.like_btn.setFlat(True)
+        self.like_btn.setFixedSize(22, 22)
+        self.like_btn.setIconSize(QSize(16, 16))
+        self.like_btn.setCursor(Qt.PointingHandCursor)
+        self.like_btn.setStyleSheet("QPushButton { border: none; background: transparent; padding: 0; }")
+        self.like_btn.setEnabled(False)
+        self.like_btn.clicked.connect(self._toggle_favorite)
+        self._update_like_button()
 
         self.position_slider = SeekSlider(Qt.Horizontal)
         self.position_slider.setRange(0, 0)
@@ -211,6 +222,7 @@ class PlayerWidget(QWidget):
         row.addWidget(self.stop_btn)
         row.addWidget(self.next_btn)
         row.addLayout(slider_col, 1)
+        row.addWidget(self.like_btn)
         row.addWidget(self.time_label)
         self.volume_label = QLabel()
         self.volume_label.setPixmap(icon("volume").pixmap(16, 16))
@@ -264,6 +276,7 @@ class PlayerWidget(QWidget):
         self._full_title = track.display_name
         self._update_elided_title()
         self.cover_label.setPixmap(cover_pixmap(track.cover_path, 40))
+        self._update_like_button()
         if autoplay:
             self.player.play()
         self._load_waveform(track)
@@ -287,6 +300,9 @@ class PlayerWidget(QWidget):
             self._transition_output.setVolume(value / 100)
 
     def _on_audio_buffer(self, source_player, buffer):
+        # Buffers can still arrive after stop/pause; they must not relight the meter.
+        if source_player.playbackState() != QMediaPlayer.PlayingState:
+            return
         if not buffer.isValid() or buffer.sampleCount() == 0:
             return
         sample_format = buffer.format().sampleFormat()
@@ -329,24 +345,25 @@ class PlayerWidget(QWidget):
         return self._transition_timer.isActive()
 
     def _load_waveform(self, track: Track):
+        self.waveform_chart.set_beat_grid(None)
         self.waveform_chart.set_peaks(track.waveform_peaks)
         self.waveform_chart.set_playhead(None)
         self.waveform_chart.set_bpm(track.tempo)
         self.waveform_chart.set_beat_offset(track.beat_offset)
         self.waveform_chart.set_duration(track.duration)
 
-        if len(self.waveform_chart.peaks) >= 2400:
-            return
-
-        worker = _WaveformWorker(track.filepath)
+        worker = _WaveformWorker(track.filepath, track.tempo)
         worker.done.connect(self._on_waveform_peaks)
         worker.finished.connect(lambda: self._waveform_workers.discard(worker))
         self._waveform_workers.add(worker)
         worker.start()
 
-    def _on_waveform_peaks(self, filepath: str, peaks: list):
+    def _on_waveform_peaks(self, filepath: str, peaks: list, grid=None, detail=None):
         if self.current_track and filepath == self.current_track.filepath:
-            self.waveform_chart.set_peaks(peaks)
+            if len(self.waveform_chart.peaks) < 2400 and peaks:
+                self.waveform_chart.set_peaks(peaks)
+            self.waveform_chart.set_detail_peaks(detail)
+            self.waveform_chart.set_beat_grid(grid)
 
     def _seek_to(self, seconds: float):
         if self.current_track is None:
@@ -388,6 +405,8 @@ class PlayerWidget(QWidget):
     def stop(self):
         self._cancel_crossfade()
         self.player.stop()
+        self._deck_levels = {self.player: (0.0, 0.0), self._transition_player: (0.0, 0.0)}
+        self.audio_levels_changed.emit(-60.0, -60.0)
 
     def _on_position_changed(self, player, pos: int):
         if player is not self.player:
@@ -452,8 +471,28 @@ class PlayerWidget(QWidget):
             self._full_title = track.display_name
             self._update_elided_title()
             self.cover_label.setPixmap(cover_pixmap(track.cover_path, 40))
+            self._update_like_button()
             self._load_waveform(track)
             self.track_transitioned.emit(track)
+
+    def _toggle_favorite(self):
+        if self.current_track is None:
+            return
+        self.current_track.favorite = not self.current_track.favorite
+        self._update_like_button()
+        self.favorite_toggled.emit(self.current_track)
+
+    def set_favorite_state(self, track_id: int, favorite: bool):
+        """Sync the like button when the current track is (un)liked elsewhere."""
+        if self.current_track is not None and self.current_track.id == track_id:
+            self.current_track.favorite = favorite
+            self._update_like_button()
+
+    def _update_like_button(self):
+        liked = bool(self.current_track and self.current_track.favorite)
+        self.like_btn.setEnabled(self.current_track is not None)
+        self.like_btn.setIcon(heart_icon(liked))
+        self.like_btn.setToolTip("Remove from favorites" if liked else "Add to favorites")
 
     def _cancel_crossfade(self):
         self._transition_timer.stop()
@@ -501,6 +540,7 @@ class PlayerWidget(QWidget):
         self.next_btn.setIcon(icon("next"))
         self._update_crossfade_button(self.crossfade_btn.isChecked())
         self.volume_label.setPixmap(icon("volume").pixmap(16, 16))
+        self._update_like_button()
         expanded = self.waveform_chart.isVisible()
         self.expand_btn.setIcon(icon("chevron-down") if expanded else icon("chevron-up"))
         if bg and bass and treble:

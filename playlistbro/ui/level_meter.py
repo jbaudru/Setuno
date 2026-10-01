@@ -40,7 +40,7 @@ class StereoLevelMeter(QWidget):
         segment_height = max(1, (bottom - top - (segments - 1) * segment_gap) // segments)
         for channel, level_db in enumerate((self._left_db, self._right_db)):
             x = margin + channel * (bar_width + gap)
-            active = round(((level_db + 60.0) / 60.0) * segments)
+            active = 0 if level_db <= -59.0 else round(((level_db + 60.0) / 60.0) * segments)
             for index in range(segments):
                 ratio = (index + 1) / segments
                 if ratio <= 0.68:

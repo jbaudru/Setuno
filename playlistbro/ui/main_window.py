@@ -127,6 +127,9 @@ class MainWindow(QMainWindow):
             on_queue_track=self._add_to_queue,
         )
         self.graph_view.set_played_ids(self.played_track_ids)
+        self.player.favorite_toggled.connect(self._on_player_favorite_toggled)
+        self.library_view.on_favorite_changed = self._on_list_favorite_changed
+        self.playlist_builder.on_favorite_changed = self._on_list_favorite_changed
 
         self.tabs = QTabWidget()
         self.tabs.addTab(self.library_view, "Library")
@@ -295,7 +298,7 @@ class MainWindow(QMainWindow):
             palette["bg"], palette["accent"], palette["text"], palette["accent_strong"],
         )
         self.graph_view.apply_theme(
-            palette["accent_strong"], palette["accent"], palette["muted_text"],
+            palette["accent_strong"], palette["accent"], palette["muted_text"], palette["bg"],
         )
         self.queue_view.apply_theme(
             palette["bg"], palette["accent_strong"], palette["accent"],
@@ -333,6 +336,16 @@ class MainWindow(QMainWindow):
     def _open_saved_playlist(self, record: dict):
         self.playlist_builder.load_saved_playlist(record)
         self.tabs.setCurrentWidget(self.playlist_builder)
+
+    def _on_player_favorite_toggled(self, track):
+        self.db.set_favorite(track.id, track.favorite)
+        self.library_view.set_favorite_state(track.id, track.favorite)
+        self.playlist_builder.set_favorite_state(track.id, track.favorite)
+
+    def _on_list_favorite_changed(self, track_id: int, favorite: bool):
+        self.player.set_favorite_state(track_id, favorite)
+        self.library_view.set_favorite_state(track_id, favorite)
+        self.playlist_builder.set_favorite_state(track_id, favorite)
 
     def _on_library_changed(self):
         self.library_view.refresh_from_db()

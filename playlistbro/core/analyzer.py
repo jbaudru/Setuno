@@ -3594,6 +3594,84 @@ def compute_waveform_peaks(
     return _downsample_waveform_peaks(samples, num_points)
 
 
+def compute_beat_grid(samples: np.ndarray, sr: int, bpm: float) -> dict | None:
+    """Lock a beat grid onto the kicks of the full track.
+
+    Fine-tunes the BPM (+/-1.5%) and phase on a low-band onset envelope, then picks
+    the downbeat as the beat where section changes (low-band energy jumps) land.
+    Returns {"bpm", "offset"} with `offset` on a downbeat, or None.
+    """
+    if not bpm or bpm <= 0 or len(samples) < sr * 4:
+        return None
+
+    decim = 8
+    x = samples[: len(samples) // decim * decim].reshape(-1, decim).mean(axis=1)
+    sr2 = sr / decim
+    n_fft, hop = 128, 16
+    count = 1 + (len(x) - n_fft) // hop
+    if count < 64:
+        return None
+    frames = np.lib.stride_tricks.as_strided(
+        x, shape=(count, n_fft), strides=(x.strides[0] * hop, x.strides[0]),
+    )
+    max_bin = max(2, int(150 * n_fft / sr2))
+    mag = np.abs(np.fft.rfft(frames * np.hanning(n_fft), axis=1))[:, 1:max_bin + 1]
+    log_mag = np.log1p(100.0 * mag)
+    onset = np.maximum(0.0, np.diff(log_mag, axis=0, prepend=log_mag[:1])).sum(axis=1)
+    times = (np.arange(count) * hop + n_fft / 2) / sr2
+    duration = len(samples) / sr
+
+    bins = 240
+    best = (-1.0, bpm, 0.0)
+    for candidate in bpm * (1.0 + np.linspace(-0.015, 0.015, 301)):
+        period = 60.0 / candidate
+        idx = ((times % period) / period * bins).astype(int) % bins
+        hist = np.bincount(idx, weights=onset, minlength=bins)
+        hist = hist + 0.5 * (np.roll(hist, 1) + np.roll(hist, -1))
+        peak = int(np.argmax(hist))
+        score = hist[peak] / (hist.mean() + 1e-9)
+        if score > best[0]:
+            left, right = hist[peak - 1], hist[(peak + 1) % bins]
+            denom = left - 2 * hist[peak] + right
+            shift = 0.5 * (left - right) / denom if denom else 0.0
+            best = (score, float(candidate), ((peak + 0.5 + shift) / bins) * period)
+    _score, bpm, phase = best
+    period = 60.0 / bpm
+
+    energy = log_mag.mean(axis=1)
+    beat_times = np.arange(phase, duration, period)
+    if len(beat_times) < 8:
+        return {"bpm": bpm, "offset": phase}
+    beat_index = np.clip(np.searchsorted(times, beat_times), 0, count - 1)
+    beat_energy = np.add.reduceat(energy, beat_index) / np.maximum(1, np.diff(beat_index, append=count))
+    jumps = np.maximum(0.0, np.diff(beat_energy, prepend=beat_energy[0]))
+    downbeat = int(np.argmax([jumps[b::4].sum() for b in range(4)]))
+    return {"bpm": bpm, "offset": phase + downbeat * period}
+
+
+def compute_waveform_and_grid(filepath: str, bpm: float | None, num_points: int = 2400,
+                              detail_rate: int = 500):
+    """Decode once and return (waveform peaks, beat grid or None, detail peaks at `detail_rate`/s)."""
+    import miniaudio
+
+    decoded = miniaudio.decode_file(
+        filepath,
+        output_format=miniaudio.SampleFormat.FLOAT32,
+        nchannels=1,
+        sample_rate=ANALYSIS_SR,
+    )
+    samples = np.frombuffer(bytes(decoded.samples), dtype=np.float32)
+    grid = compute_beat_grid(samples, ANALYSIS_SR, bpm) if bpm else None
+    block = max(1, ANALYSIS_SR // detail_rate)
+    usable = len(samples) // block * block
+    if usable:
+        detail = np.abs(samples[:usable]).reshape(-1, block).max(axis=1)
+        detail /= float(np.abs(samples).max()) or 1.0
+    else:
+        detail = np.zeros(0, dtype=np.float32)
+    return _downsample_waveform_peaks(samples, num_points), grid, detail.astype(np.float32)
+
+
 def _downsample_waveform_peaks(samples: np.ndarray, num_points: int) -> list:
 
     if len(samples) == 0:

@@ -14,6 +14,13 @@ from ..core.database import Database
 from ..core.models import Track
 from ..core.playlist_engine import track_similarity
 from .icon_loader import cover_pixmap, icon
+from .stats_widget import palette_shade
+
+BPM_SCALE = 8.0  # scene units per BPM
+ENERGY_SCALE = 80.0  # scene units per energy point
+NODE_GAP = 3.0
+NODE_SPACING = 0.9  # lattice step as a fraction of the largest node diameter
+NODE_NUDGE = 0.1  # max shift (in lattice steps) from a slot toward the exact point
 
 
 class _GraphView(QGraphicsView):
@@ -25,6 +32,7 @@ class _GraphView(QGraphicsView):
     def wheelEvent(self, event):
         factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
         self.scale(factor, factor)
+        self.parentWidget()._update_label_visibility()
 
 
 class _TrackNode(QGraphicsEllipseItem):
@@ -73,7 +81,7 @@ class SimilarityGraphView(QWidget):
         self._node_color = QColor("#8686AC")
         self._edge_color = QColor("#6b6b85")
         self._label_color = QColor("#d8d8ec")
-        self._cluster_colors = ["#e06c48", "#48b5a8", "#d3a541", "#d86890", "#69a6e8", "#9aac55"]
+        self._bg_color = QColor("#33334d")
         self._nodes = {}
         self._labels = {}
         self._edges = []
@@ -134,28 +142,32 @@ class SimilarityGraphView(QWidget):
             self.details_label.setText("Scan music in the Library tab to build the similarity graph.")
             return
         displayed = tracks
-        nearest = self._nearest_candidates(displayed)
+        matrix = self._feature_matrix(displayed)
+        nearest = self._nearest_candidates(displayed, matrix)
         edge_scores = {
             tuple(sorted((track_id, neighbor_id))): score
             for track_id, candidates in nearest.items()
             for score, neighbor_id in candidates
             if score >= 42
         }
-        cluster_by_id = self._clusters(displayed, edge_scores)
-        positions = self._feature_positions(displayed)
+        cluster_by_id = self._clusters(displayed, matrix)
         degree = {track.id: 0 for track in displayed}
         for first_id, second_id in edge_scores:
             degree[first_id] += 1
             degree[second_id] += 1
+        radii = {track.id: 5 + min(7, degree[track.id] * 1.2) for track in displayed}
+        positions = self._feature_positions(displayed, radii)
+        self._draw_axes(displayed)
         for track in displayed:
-            node_radius = 6 + min(12, degree[track.id] * 1.5)
+            node_radius = radii[track.id]
             node = _TrackNode(track, self._select_track, self._highlight,
                               self.on_queue_track,
                               -node_radius, -node_radius, node_radius * 2, node_radius * 2)
             node.setPos(*positions[track.id])
-            node.base_color = QColor(self._cluster_colors[cluster_by_id[track.id] % len(self._cluster_colors)])
+            node.cluster = cluster_by_id[track.id]
+            node.base_color = self._cluster_color(node.cluster)
             node.setBrush(QBrush(node.base_color))
-            node.setPen(QPen(Qt.white, 0))
+            node.setPen(QPen(self._bg_color, 0))
             node.setZValue(1)
             self.scene.addItem(node)
             self._nodes[track.id] = node
@@ -178,10 +190,6 @@ class SimilarityGraphView(QWidget):
             self.scene.addItem(line)
             self._edges.append((first_id, second_id, score, line))
         self._update_edges()
-        bpm_axis = self.scene.addSimpleText("BPM  -->", QFont("Segoe UI", 9))
-        bpm_axis.setPos(min(x for x, _ in positions.values()), max(y for _, y in positions.values()) + 55)
-        energy_axis = self.scene.addSimpleText("Energy  ^", QFont("Segoe UI", 9))
-        energy_axis.setPos(min(x for x, _ in positions.values()) - 100, min(y for _, y in positions.values()) - 35)
         self.scene.setSceneRect(self.scene.itemsBoundingRect().adjusted(-100, -100, 100, 100))
         self._dirty = False
         self.reset_view()
@@ -194,10 +202,7 @@ class SimilarityGraphView(QWidget):
             self._pulse_timer.stop()
 
     @staticmethod
-    def _nearest_candidates(tracks):
-        """Vectorize broad matching, then exact-score only a small candidate set."""
-        if len(tracks) < 2:
-            return {track.id: [] for track in tracks}
+    def _feature_matrix(tracks):
         descriptor_keys = (
             "spectral_centroid", "spectral_rolloff", "spectral_flatness", "bass_ratio",
             "low_mid_ratio", "mid_ratio", "high_ratio", "brightness", "harmonicity",
@@ -215,7 +220,13 @@ class SimilarityGraphView(QWidget):
                 math.log1p(max(0, track.filesize)) / 20,
                 *(np.asarray(descriptors, dtype=np.float32) / scales),
             ])
-        matrix = np.asarray(vectors, dtype=np.float32)
+        return np.asarray(vectors, dtype=np.float32).reshape(len(tracks), -1)
+
+    @staticmethod
+    def _nearest_candidates(tracks, matrix):
+        """Vectorize broad matching, then exact-score only a small candidate set."""
+        if len(tracks) < 2:
+            return {track.id: [] for track in tracks}
         nearest = {}
         candidate_count = min(16, len(tracks) - 1)
         for index, track in enumerate(tracks):
@@ -230,35 +241,113 @@ class SimilarityGraphView(QWidget):
             nearest[track.id] = scored[:3]
         return nearest
 
-    def _clusters(self, tracks, edge_scores):
-        parent = {track.id: track.id for track in tracks}
-        def find(track_id):
-            while parent[track_id] != track_id:
-                parent[track_id] = parent[parent[track_id]]
-                track_id = parent[track_id]
-            return track_id
-        for (first_id, second_id), score in edge_scores.items():
-            if score >= 58:
-                parent[find(first_id)] = find(second_id)
-        groups = {find(track.id) for track in tracks}
-        group_index = {group: index for index, group in enumerate(sorted(groups))}
-        return {track.id: group_index[find(track.id)] for track in tracks}
+    @staticmethod
+    def _clusters(tracks, matrix):
+        """K-means on standardized features; cluster ids ordered by mean tempo."""
+        n = len(tracks)
+        k = max(1, min(8, int(round(math.sqrt(n / 4)))))
+        if n <= k:
+            return {track.id: index for index, track in enumerate(tracks)}
+        data = (matrix - matrix.mean(axis=0)) / (matrix.std(axis=0) + 1e-6)
+        rng = np.random.default_rng(7)
+        centers = [data[rng.integers(n)]]
+        for _ in range(1, k):
+            dist = np.min([np.sum((data - c) ** 2, axis=1) for c in centers], axis=0)
+            total = dist.sum()
+            centers.append(data[rng.choice(n, p=dist / total)] if total > 0 else data[rng.integers(n)])
+        centers = np.asarray(centers)
+        labels = np.zeros(n, dtype=int)
+        for _ in range(25):
+            labels = np.argmin(((data[:, None, :] - centers[None, :, :]) ** 2).sum(axis=2), axis=1)
+            new_centers = np.asarray([
+                data[labels == c].mean(axis=0) if np.any(labels == c) else centers[c] for c in range(k)
+            ])
+            if np.allclose(new_centers, centers):
+                break
+            centers = new_centers
+        tempos = np.asarray([float(t.tempo) for t in tracks])
+        order = sorted(range(k), key=lambda c: tempos[labels == c].mean() if np.any(labels == c) else 0)
+        rank = {c: index for index, c in enumerate(order)}
+        return {track.id: rank[int(labels[i])] for i, track in enumerate(tracks)}
 
-    def _feature_positions(self, tracks):
-        """Fixed axes: 8 scene units per BPM and 80 per energy point."""
+    def _cluster_color(self, cluster: int) -> QColor:
+        return palette_shade(self._node_color, cluster)
+
+    def _feature_positions(self, tracks, radii):
+        """Place each node on the free lattice slot closest to its (BPM, energy) point.
+
+        Slots are tighter than a full node diameter and nodes are nudged toward their exact
+        point, so large nodes may overlap slightly in exchange for more accurate placement.
+        """
+        cell = 2 * max(radii.values()) * NODE_SPACING
+        nudge = NODE_NUDGE
+        occupied: set[tuple[int, int]] = set()
         positions = {}
-        duplicates = {}
-        for track in sorted(tracks, key=lambda item: item.id):
-            key = (float(track.tempo), float(track.energy))
-            index = duplicates.get(key, 0)
-            duplicates[key] = index + 1
-            angle = index * 2.399963229728653
-            offset = min(20, 10 * math.sqrt(index))
-            positions[track.id] = (
-                key[0] * 8 + math.cos(angle) * offset,
-                -key[1] * 80 + math.sin(angle) * offset,
-            )
+        # Hubs first so the best-connected songs sit exactly on their coordinates.
+        for track in sorted(tracks, key=lambda t: (-radii[t.id], t.id)):
+            ax, ay = float(track.tempo) * BPM_SCALE / cell, -float(track.energy) * ENERGY_SCALE / cell
+            cx, cy = round(ax), round(ay)
+            ring = 0
+            best = None
+            while best is None or ring <= best[0] + 1:
+                for dx in range(-ring, ring + 1):
+                    for dy in (-ring, ring) if abs(dx) != ring else range(-ring, ring + 1):
+                        slot = (cx + dx, cy + dy)
+                        if slot in occupied:
+                            continue
+                        dist = (slot[0] - ax) ** 2 + (slot[1] - ay) ** 2
+                        if best is None or dist < best[1]:
+                            best = (ring, dist, slot)
+                ring += 1
+            sx, sy = best[2]
+            occupied.add(best[2])
+            px = sx + max(-nudge, min(nudge, ax - sx))
+            py = sy + max(-nudge, min(nudge, ay - sy))
+            positions[track.id] = (px * cell, py * cell)
         return positions
+
+    def _draw_axes(self, tracks):
+        tempos = [float(t.tempo) for t in tracks]
+        bpm_lo = int(math.floor(min(tempos) / 10) * 10)
+        bpm_hi = int(math.ceil(max(tempos) / 10) * 10)
+        left = bpm_lo * BPM_SCALE - 60
+        right = bpm_hi * BPM_SCALE + 60
+        top = -10.5 * ENERGY_SCALE
+        bottom = 0.5 * ENERGY_SCALE
+        axis_color = QColor(self._label_color)
+        axis_color.setAlpha(150)
+        grid_color = QColor(self._label_color)
+        grid_color.setAlpha(22)
+        font = QFont("Segoe UI", 8)
+        axis_pen = QPen(axis_color, 1.2)
+        axis_pen.setCosmetic(True)
+        grid_pen = QPen(grid_color, 1)
+        grid_pen.setCosmetic(True)
+
+        def add_text(text, x, y, align_right=False, align_center=False):
+            item = self.scene.addSimpleText(text, font)
+            item.setBrush(QBrush(axis_color))
+            rect = item.boundingRect()
+            dx = -rect.width() if align_right else (-rect.width() / 2 if align_center else 0)
+            item.setPos(x + dx, y - rect.height() / 2)
+            item.setZValue(-3)
+            return item
+
+        self.scene.addLine(left, bottom, right, bottom, axis_pen).setZValue(-3)
+        self.scene.addLine(left, top, left, bottom, axis_pen).setZValue(-3)
+        step = 10 if bpm_hi - bpm_lo <= 120 else 20
+        for bpm in range(bpm_lo, bpm_hi + 1, step):
+            x = bpm * BPM_SCALE
+            self.scene.addLine(x, top, x, bottom, grid_pen).setZValue(-4)
+            self.scene.addLine(x, bottom, x, bottom + 6, axis_pen).setZValue(-3)
+            add_text(str(bpm), x, bottom + 16, align_center=True)
+        for energy in range(0, 11, 2):
+            y = -energy * ENERGY_SCALE
+            self.scene.addLine(left, y, right, y, grid_pen).setZValue(-4)
+            self.scene.addLine(left - 6, y, left, y, axis_pen).setZValue(-3)
+            add_text(str(energy), left - 10, y, align_right=True)
+        add_text("BPM", right, bottom + 16, align_right=True)
+        add_text("Energy", left - 10, top - 14, align_right=True)
 
     def _update_edges(self):
         for first_id, second_id, _score, line in self._edges:
@@ -277,7 +366,8 @@ class SimilarityGraphView(QWidget):
         for track_id, node in self._nodes.items():
             is_linked = track_id in linked_ids
             node.setOpacity(1.0 if active_id is None or is_linked else 0.18)
-            node.setPen(QPen(Qt.white, 1.8 if track_id == active_id else 0))
+            node.setPen(QPen(self._label_color if track_id == active_id else self._bg_color,
+                             1.8 if track_id == active_id else 0))
             self._labels[track_id].setOpacity(1.0 if active_id is None or is_linked else 0.12)
         for first_id, second_id, _score, line in self._edges:
             is_linked = active_id is not None and active_id in (first_id, second_id)
@@ -310,6 +400,13 @@ class SimilarityGraphView(QWidget):
         self.scene.setSceneRect(self.scene.itemsBoundingRect().adjusted(-100, -100, 100, 100))
         self.view.resetTransform()
         self.view.fitInView(self.scene.sceneRect(), Qt.KeepAspectRatio)
+        self._update_label_visibility()
+
+    def _update_label_visibility(self):
+        # Titles only once zoomed in enough to read them without piling up.
+        visible = len(self._labels) <= 40 or self.view.transform().m11() >= 1.1
+        for label in self._labels.values():
+            label.setVisible(visible)
 
     def _center_node(self, node):
         scale = self.view.transform().m11()
@@ -322,6 +419,7 @@ class SimilarityGraphView(QWidget):
             self.scene.itemsBoundingRect().adjusted(-margin_x, -margin_y, margin_x, margin_y)
         )
         self.view.centerOn(node)
+        self._update_label_visibility()
 
     def most_similar_neighbor(self, track_id: int):
         candidates = [
@@ -366,9 +464,16 @@ class SimilarityGraphView(QWidget):
             f"Energy {track.energy:.1f} | {track.duration_str}"
         )
 
-    def apply_theme(self, accent: str, edge: str, label: str):
+    def apply_theme(self, accent: str, edge: str, label: str, bg: str | None = None):
         self._node_color = QColor(accent)
         self._edge_color = QColor(edge)
         self._label_color = QColor(label)
+        if bg:
+            self._bg_color = QColor(bg)
+        for node in self._nodes.values():
+            node.base_color = self._cluster_color(node.cluster)
+            node.setBrush(QBrush(node.base_color))
+        self._dirty = self._dirty or bool(self._nodes)  # axes/edges pick up the new colors on rebuild
         self.set_played_ids(self._played_ids)
+        self._highlight(self._selected_id)
         self.reset_btn.setIcon(icon("reset"))

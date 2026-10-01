@@ -15,7 +15,7 @@ never leaves your machine. At startup, Setuno checks GitHub for new releases whe
 
 Created by **J. Baudru (Bonoob)**.
 
-Latest changes: [Setuno v1.2.1](CHANGELOG.md).
+Latest changes: [Setuno v1.2.2](CHANGELOG.md).
 
 ## Download
 

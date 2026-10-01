@@ -70,14 +70,22 @@ def _cover_placeholder(size: int) -> QPixmap:
     return _cover_placeholder_cache[size]
 
 
+_cover_cache: dict[tuple[str, int], QPixmap] = {}
+
+
 def cover_pixmap(cover_path: str, size: int = 32) -> QPixmap:
     """Load a track's cached album-art thumbnail, or a vinyl-disk placeholder if it has none."""
     if cover_path:
+        key = (cover_path, size)
+        cached = _cover_cache.get(key)
+        if cached is not None:
+            return cached
         pixmap = QPixmap(cover_path)
         if not pixmap.isNull():
             scaled = pixmap.scaled(size, size, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
             x = max(0, (scaled.width() - size) // 2)
             y = max(0, (scaled.height() - size) // 2)
-            return scaled.copy(x, y, size, size)
+            _cover_cache[key] = scaled.copy(x, y, size, size)
+            return _cover_cache[key]
     return _cover_placeholder(size)
 
