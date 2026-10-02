@@ -31,6 +31,21 @@ UNAVAILABLE_COLOR = "#e06c48"
 PLAYED_COLOR = "#38a169"
 
 
+def duplicate_tracks(tracks: list[Track]) -> list[Track]:
+    """Return later tracks whose normalized artist/title matches an earlier track."""
+    seen = set()
+    duplicates = []
+    for track in tracks:
+        key = (track.artist.strip().casefold(), track.title.strip().casefold())
+        if not any(key):
+            continue
+        if key in seen:
+            duplicates.append(track)
+        else:
+            seen.add(key)
+    return duplicates
+
+
 def show_in_file_explorer(filepath: str):
     if is_readable_file(filepath):
         explorer = str(Path(os.environ.get("SystemRoot", "C:/Windows")) / "explorer.exe")
@@ -151,6 +166,7 @@ class LibraryView(QWidget):
     def __init__(
         self, db: Database, on_library_changed=None, on_play_track=None,
         get_library_folders=None, set_library_folders=None, on_queue_track=None,
+        on_add_to_playlist=None,
         is_track_played=None, get_visible_columns=None, set_visible_columns=None, parent=None,
     ):
         super().__init__(parent)
@@ -160,6 +176,7 @@ class LibraryView(QWidget):
         self.get_library_folders = get_library_folders or (lambda: [])
         self.set_library_folders = set_library_folders or (lambda folders: None)
         self.on_queue_track = on_queue_track
+        self.on_add_to_playlist = on_add_to_playlist
         self.is_track_played = is_track_played or (lambda _track_id: False)
         self.on_favorite_changed = None
         self.get_visible_columns = get_visible_columns or (lambda: None)
@@ -533,6 +550,25 @@ class LibraryView(QWidget):
                 ids.append(item.data(1000))
         return ids
 
+    def focus_track(self, track_id: int) -> bool:
+        """Select and center a track, clearing filters only when they hide it."""
+        row_ids = self.get_row_ids()
+        if track_id not in row_ids:
+            self.search_edit.clear()
+            self._search_timer.stop()
+            self.folder_combo.setCurrentIndex(0)
+            self.refresh_table()
+            row_ids = self.get_row_ids()
+        if track_id not in row_ids:
+            return False
+        row = row_ids.index(track_id)
+        self.table.setCurrentCell(row, TITLE_COL)
+        self.table.selectRow(row)
+        self.table.scrollToItem(
+            self.table.item(row, TITLE_COL), QAbstractItemView.PositionAtCenter,
+        )
+        return True
+
     def _apply_playing_marker(self):
         """Highlight the row of the currently playing track (background only).
 
@@ -680,6 +716,9 @@ class LibraryView(QWidget):
         key_action = menu.addAction("Edit Key...")
         metadata_action = menu.addAction("Edit Metadata...")
         waveform_action = menu.addAction("Show Waveform...")
+        add_to_playlist_action = None
+        if self.on_add_to_playlist:
+            add_to_playlist_action = menu.addAction("Add to Playlist Builder")
         queue_action = menu.addAction(
             "Add Selected to Queue" if len(selected_rows) > 1 else "Add to Queue"
         )
@@ -696,6 +735,8 @@ class LibraryView(QWidget):
             self.refresh_from_db()
         elif chosen == waveform_action:
             self._show_waveform(track)
+        elif add_to_playlist_action is not None and chosen == add_to_playlist_action:
+            self.on_add_to_playlist(track)
         elif chosen == explorer_action:
             show_in_file_explorer(track.filepath)
         elif chosen == queue_action and self.on_queue_track:
@@ -717,9 +758,12 @@ class LibraryView(QWidget):
     def _remove_track(self, track: Track):
         self._remove_tracks([track])
 
-    def _remove_tracks(self, tracks: list[Track]):
+    def remove_duplicate_tracks(self) -> int:
+        return self._remove_tracks(duplicate_tracks(self.tracks))
+
+    def _remove_tracks(self, tracks: list[Track]) -> int | None:
         if not tracks:
-            return
+            return 0
         count = len(tracks)
         names = f"{count} tracks" if count > 1 else f"'{tracks[0].display_name}'"
         answer = QMessageBox.question(
@@ -728,12 +772,13 @@ class LibraryView(QWidget):
             "The file itself will not be deleted from disk.",
         )
         if answer != QMessageBox.Yes:
-            return
+            return None
         self.db.delete_tracks(track.id for track in tracks)
         if self.on_library_changed:
             self.on_library_changed()
         else:
             self.refresh_from_db()
+        return count
 
     def apply_theme(self, bg: str | None = None, bass: str | None = None, treble: str | None = None):
         """Refresh flat icons (colors are set globally in icon_loader before calling this)."""

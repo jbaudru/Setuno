@@ -8,6 +8,10 @@ _DEFAULTS = {
     "theme": "light", "library_folders": [],
     "show_level_meter": True,
     "library_visible_columns": None,
+    "auto_mix": True,
+    "auto_mix_bpm_sync": True,
+    "auto_mix_energy_match": False,
+    "auto_mix_duration_ms": 16000,
 }
 
 

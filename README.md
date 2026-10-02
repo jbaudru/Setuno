@@ -15,7 +15,7 @@ never leaves your machine. At startup, Setuno checks GitHub for new releases whe
 
 Created by **J. Baudru (Bonoob)**.
 
-Latest changes: [Setuno v1.2.2](CHANGELOG.md).
+Latest changes: [Setuno v1.3.1](CHANGELOG.md).
 
 ## Download
 
@@ -87,10 +87,15 @@ Choose from Setuno's dark presentation or the Rekordbox-inspired color scheme.
   - **Tempo + Energy progression**: combined build across the set
 - "Keep" checkboxes in the Playlist Builder to pin favorite tracks and regenerate the rest of
   the set around them
+- Add a single library track to the current Playlist Builder playlist, with Keep enabled, and
+  remove duplicate songs from either the Library or playlist
 - Target set length (30 min, 1h, 2h, ...) or a fixed track count, with duration-aware selection
 - Filter by genre / tempo range / energy range
 - Embedded audio player with click-to-seek and an extendable waveform view showing live playback
-  progress, plus optional tempo-matched auto-crossfade into the next visible track
+  progress, plus beat-synced auto-mix enabled by default with smooth fade and tempo curves, a
+  blinking transition indicator, configurable 8-32 second transitions, and a BPM/grid match
+  toggle; optional energy matching is off by default
+- Click the player track name to find it in the Library
 - Per-track waveform viewer with zoom/pan, BPM grid, and independent preview playback (seek and
   play a section without disturbing the main player)
 - Full metadata editor (title/artist/album/genre/cover art) from the Library or Playlist Builder

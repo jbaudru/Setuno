@@ -5,7 +5,7 @@
 ;   pyinstaller build.spec
 
 #define MyAppName "Setuno"
-#define MyAppVersion "1.2.2"
+#define MyAppVersion "1.3.1"
 #define MyAppPublisher "J. Baudru (Bonoob)"
 #define MyAppExeName "Setuno.exe"
 

@@ -426,6 +426,14 @@ QSlider::sub-page:horizontal {{
     border-radius: 2px;
 }}
 
+QSlider#playerProgressSlider[transitionBlink="on"]::sub-page:horizontal {{
+    background: {p['accent_strong']};
+}}
+
+QSlider#playerProgressSlider[transitionBlink="off"]::sub-page:horizontal {{
+    background: {p['accent']};
+}}
+
 
 /* ================================================================
    Labels

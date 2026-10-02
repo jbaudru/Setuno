@@ -737,6 +737,78 @@ class PlaylistBuilder(QWidget):
         self.table.blockSignals(False)
         self._apply_playing_marker()
 
+    def add_track_to_playlist(self, track):
+        """Append one library track and pin it in the current playlist."""
+        if track is None or track.id is None:
+            return False
+        existing = next((item for item in self.current_playlist if item.id == track.id), None)
+        if existing is None:
+            self.current_playlist.append(track)
+        self._locked_ids.add(track.id)
+        self._populate_table(self.current_playlist)
+        self.stats_widget.update_stats(self.current_playlist)
+        enabled = bool(self.current_playlist)
+        for button in (self.save_m3u_btn, self.export_folder_btn, self.save_library_btn):
+            button.setEnabled(enabled)
+        row = next(index for index, item in enumerate(self.current_playlist) if item.id == track.id)
+        self.table.selectRow(row)
+        return True
+
+    def remove_duplicates(self) -> int:
+        """Keep the first visible row for each track, file, or artist/title pair."""
+        tracks_by_id = {track.id: track for track in self.current_playlist}
+        table_tracks = []
+        row_count = self.table.rowCount()
+        for row in range(row_count):
+            id_item = self.table.item(row, KEEP_COL)
+            track = tracks_by_id.get(id_item.data(1000)) if id_item else None
+            if track is None:
+                continue
+            title_item = self.table.item(row, TITLE_COL)
+            artist_item = self.table.item(row, TITLE_COL + 1)
+            title = title_item.text().lstrip("\u25b6 ") if title_item else track.title
+            artist = artist_item.text() if artist_item else track.artist
+            table_tracks.append((track, artist, title))
+
+        source_tracks = (
+            table_tracks if table_tracks and len(table_tracks) == row_count
+            else [(track, track.artist, track.title) for track in self.current_playlist]
+        )
+        unique_tracks = []
+        seen_ids = set()
+        seen_names = set()
+        seen_paths = set()
+        for track, artist, title in source_tracks:
+            artist = (artist or "").strip().casefold()
+            title = (title or "").strip().casefold()
+            name_key = (artist, title) if artist or title else None
+            path_key = track.filepath.replace("\\", "/").rstrip("/").casefold()
+            if (
+                (track.id is not None and track.id in seen_ids)
+                or (name_key is not None and name_key in seen_names)
+                or (path_key and path_key in seen_paths)
+            ):
+                continue
+            unique_tracks.append(track)
+            if track.id is not None:
+                seen_ids.add(track.id)
+            if name_key is not None:
+                seen_names.add(name_key)
+            if path_key:
+                seen_paths.add(path_key)
+
+        removed = len(source_tracks) - len(unique_tracks)
+        if not removed:
+            return 0
+        self.current_playlist = unique_tracks
+        self._locked_ids.intersection_update(track.id for track in unique_tracks)
+        self._populate_table(self.current_playlist)
+        self.stats_widget.update_stats(self.current_playlist)
+        enabled = bool(self.current_playlist)
+        for button in (self.save_m3u_btn, self.export_folder_btn, self.save_library_btn):
+            button.setEnabled(enabled)
+        return removed
+
     def _on_item_changed(self, item):
         """Track 'Keep' checkbox toggles so favorites survive the next Generate."""
         if item.column() != KEEP_COL:

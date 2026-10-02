@@ -6,8 +6,8 @@ import sys
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
 from PySide6.QtGui import QActionGroup, QPixmap
 from PySide6.QtWidgets import QApplication, QMainWindow, QMenu, QMessageBox, QStatusBar, QSystemTrayIcon, QTabWidget, QVBoxLayout, QWidget, QDialog, QLabel, QPushButton, QHBoxLayout
-from PySide6.QtCore import QTimer, QUrl, QSize, Qt
-from PySide6.QtGui import QDesktopServices
+from PySide6.QtCore import QEvent, QTimer, QUrl, QSize, Qt
+from PySide6.QtGui import QDesktopServices, QKeySequence
 
 from .. import __version__
 from ..core.database import Database
@@ -17,7 +17,11 @@ from .icon_loader import app_icon
 from .library_view import LibraryView
 from .level_meter import StereoLevelMeter
 from .graph_view import SimilarityGraphView
-from .player_widget import PlayerWidget
+from .player_widget import (
+    DEFAULT_TRANSITION_DURATION_MS,
+    TRANSITION_DURATIONS_SECONDS,
+    PlayerWidget,
+)
 from .playlist_builder import PlaylistBuilder
 from .playlists_view import SavedPlaylistsView
 from .queue_view import QueueView
@@ -90,7 +94,15 @@ class MainWindow(QMainWindow):
         icon_loader.set_theme_color(icon_color(self.theme))
         self.active_source: str | None = None  # 'library' or 'builder': where the current track came from
 
-        self.player = PlayerWidget()
+        self.player = PlayerWidget(
+            auto_mix=bool(self.settings.get("auto_mix", True)),
+            bpm_sync=bool(self.settings.get("auto_mix_bpm_sync", True)),
+            energy_match=bool(self.settings.get("auto_mix_energy_match", False)),
+            transition_duration_ms=int(self.settings.get(
+                "auto_mix_duration_ms", DEFAULT_TRANSITION_DURATION_MS,
+            )),
+        )
+        self.player.track_title_clicked.connect(self._focus_track_in_library)
         self.level_meter = StereoLevelMeter()
         self.player.audio_levels_changed.connect(self.level_meter.set_levels)
         self.player.track_finished.connect(self._on_track_finished)
@@ -108,6 +120,7 @@ class MainWindow(QMainWindow):
             self.db,
             on_library_changed=self._on_library_changed,
             on_play_track=lambda t: self._on_track_played("library", t),
+            on_add_to_playlist=self._add_track_to_playlist,
             get_library_folders=lambda: self.settings.get("library_folders", []),
             set_library_folders=self._set_library_folders,
             on_queue_track=self._add_to_queue,
@@ -211,11 +224,50 @@ class MainWindow(QMainWindow):
         menu = self.menuBar().addMenu("&File")
         scan_action = menu.addAction("Scan Folder...")
         scan_action.triggered.connect(self.library_view.choose_folder)
+        remove_duplicates_action = menu.addAction("Remove duplicate")
+        remove_duplicates_action.triggered.connect(self._remove_playlist_duplicates)
         menu.addSeparator()
         exit_action = menu.addAction("Exit")
         exit_action.triggered.connect(self.close)
 
+        playback_menu = self.menuBar().addMenu("&Playback")
+        self.auto_mix_action = playback_menu.addAction("Auto-mix")
+        self.auto_mix_action.setCheckable(True)
+        self.auto_mix_action.setChecked(self.player.crossfade_btn.isChecked())
+        self.auto_mix_action.toggled.connect(self._set_auto_mix)
+        self.player.crossfade_btn.toggled.connect(self.auto_mix_action.setChecked)
+
+        self.energy_match_action = playback_menu.addAction("Energy-match transitions")
+        self.energy_match_action.setCheckable(True)
+        self.energy_match_action.setChecked(self.player.energy_match)
+        self.energy_match_action.toggled.connect(self._set_energy_match)
+
+        self.bpm_sync_action = playback_menu.addAction("BPM/grid match")
+        self.bpm_sync_action.setCheckable(True)
+        self.bpm_sync_action.setChecked(self.player.bpm_sync)
+        self.bpm_sync_action.toggled.connect(self._set_bpm_sync)
+
+        duration_menu = playback_menu.addMenu("Transition duration")
+        duration_group = QActionGroup(self)
+        duration_group.setExclusive(True)
+        self.transition_duration_actions = {}
+        for seconds in TRANSITION_DURATIONS_SECONDS:
+            action = duration_menu.addAction(f"{seconds} seconds")
+            action.setCheckable(True)
+            duration_group.addAction(action)
+            self.transition_duration_actions[seconds] = action
+            action.setChecked(self.player.transition_duration_ms == seconds * 1000)
+            action.triggered.connect(
+                lambda _checked, duration=seconds * 1000: self._set_transition_duration(duration)
+            )
+
         view_menu = self.menuBar().addMenu("&View")
+        self.fullscreen_action = view_menu.addAction("Fullscreen")
+        self.fullscreen_action.setCheckable(True)
+        self.fullscreen_action.setShortcut(QKeySequence("F11"))
+        self.fullscreen_action.setShortcutContext(Qt.ApplicationShortcut)
+        self.fullscreen_action.toggled.connect(self._set_fullscreen)
+        view_menu.addSeparator()
         self.meter_action = view_menu.addAction("Show volume meter")
         self.meter_action.setCheckable(True)
         self.meter_action.setChecked(bool(self.settings.get("show_level_meter", True)))
@@ -247,6 +299,66 @@ class MainWindow(QMainWindow):
         help_menu = self.menuBar().addMenu("&Help")
         about_action = help_menu.addAction("About")
         about_action.triggered.connect(self._show_about)
+
+    def _add_track_to_playlist(self, track):
+        if self.playlist_builder.add_track_to_playlist(track):
+            self.tabs.setCurrentWidget(self.playlist_builder)
+
+    def _focus_track_in_library(self, track):
+        if track is None or track.id is None:
+            return
+        self.tabs.setCurrentWidget(self.library_view)
+        self.library_view.focus_track(track.id)
+
+    def _remove_playlist_duplicates(self):
+        if self.tabs.currentWidget() is self.library_view:
+            removed = self.library_view.remove_duplicate_tracks()
+            scope = "library"
+        else:
+            removed = self.playlist_builder.remove_duplicates()
+            scope = "playlist"
+        if removed is None:
+            message = "Duplicate removal cancelled."
+        elif removed:
+            message = f"Removed {removed} duplicate {scope} track(s)."
+        else:
+            message = f"No duplicate tracks found in the {scope}."
+        self.statusBar().showMessage(message, 5000)
+
+    def _set_fullscreen(self, enabled: bool):
+        if enabled:
+            self.showFullScreen()
+        else:
+            self.showNormal()
+
+    def _set_auto_mix(self, enabled: bool):
+        self.player.crossfade_btn.setChecked(enabled)
+        self.settings["auto_mix"] = enabled
+        save_settings(self.settings)
+
+    def _set_energy_match(self, enabled: bool):
+        self.player.energy_match = enabled
+        self.settings["auto_mix_energy_match"] = enabled
+        save_settings(self.settings)
+
+    def _set_bpm_sync(self, enabled: bool):
+        self.player.bpm_sync = enabled
+        self.settings["auto_mix_bpm_sync"] = enabled
+        save_settings(self.settings)
+
+    def _set_transition_duration(self, duration_ms: int):
+        self.player.transition_duration_ms = duration_ms
+        self.settings["auto_mix_duration_ms"] = duration_ms
+        save_settings(self.settings)
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if event.type() == QEvent.WindowStateChange and hasattr(self, "fullscreen_action"):
+            is_fullscreen = self.isFullScreen()
+            if self.fullscreen_action.isChecked() != is_fullscreen:
+                self.fullscreen_action.blockSignals(True)
+                self.fullscreen_action.setChecked(is_fullscreen)
+                self.fullscreen_action.blockSignals(False)
 
     def _build_tray_controls(self):
         self.tray_icon = QSystemTrayIcon(app_icon(), self)

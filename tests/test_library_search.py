@@ -8,7 +8,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication
 
 from playlistbro.core.models import Track
-from playlistbro.ui.library_view import LibraryView
+from playlistbro.ui.library_view import LibraryView, duplicate_tracks
 
 
 class LibrarySearchTests(unittest.TestCase):
@@ -37,7 +37,16 @@ class LibrarySearchTests(unittest.TestCase):
         view.refresh_table()
         self.assertEqual(view.table.rowCount(), 450)
         self.assertFalse(hasattr(view, "more_btn"))
+        view._search_timer.stop()
 
+    def test_duplicate_tracks_match_library_duplicate_count(self):
+        tracks = [
+            Track(id=1, artist="Jedi PROD", title="ALMEK - LOST (Remix)", genre="House"),
+            Track(id=2, artist="jedi prod", title=" almek - lost (remix) ", genre="Big Room"),
+            Track(id=3, artist="Other", title="Different"),
+        ]
+
+        self.assertEqual([track.id for track in duplicate_tracks(tracks)], [2])
 
 if __name__ == "__main__":
     unittest.main()
