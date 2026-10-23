@@ -15,7 +15,7 @@ never leaves your machine. At startup, Setuno checks GitHub for new releases whe
 
 Created by **J. Baudru (Bonoob)**.
 
-Latest changes: [Setuno v1.3.1](CHANGELOG.md).
+Latest changes: [Setuno v1.4.0](CHANGELOG.md).
 
 ## Download
 
@@ -58,7 +58,12 @@ Inspect tempo and energy curves, genre distribution, and playlist totals.
 
 ### Saved Playlists
 
-Reopen or remove saved playlist definitions from the library.
+Browse saved playlists in list or grid view, with cover art and a small song count.
+Use **Edit playlist...** to rename a playlist, choose a custom cover, or remove its cover.
+Custom covers are stored locally and the selected layout is remembered between sessions.
+Use the grid/list icon to switch layouts; refresh and delete are also icon-only buttons with tooltips.
+Double-click a playlist to reopen it in the Playlist Builder, or select it to open or delete it.
+Use **Export...** to export a saved playlist directly, without reopening the Builder.
 
 ![Setuno saved playlists](assets/screenshots/playlist-view.png)
 
@@ -77,6 +82,15 @@ Choose from Setuno's dark presentation or the Rekordbox-inspired color scheme.
   genre tags and recognized genre folders take priority over matched online metadata and the
   heuristic spectral/rhythmic genre classifier. Tempo/key detection uses `librosa` when available;
   silent audio is left without a guessed BPM, key, or genre
+- Timing analysis shares one high-resolution onset envelope between tempo estimators, then
+  refines BPM against the full track and aligns grid phase to physical attacks. The NumPy
+  fallback also uses a higher-resolution onset and fractional-lag correlation.
+  Key analysis uses tuning-corrected, harmonic-separated chroma from up to three 16-second
+  sections spread across the song, excluding silent/non-tonal sections. Manual BPM/key
+  corrections remain authoritative, including in waveform previews.
+  The grid is a constant-tempo, 4/4 estimate: half/double-tempo ambiguity, live tempo changes,
+  ambiguous keys and downbeats still require listening/manual verification; this is not a
+  claim of professional-software parity.
 - Newly scanned tracks appear in the library when the scan finishes
 - Favorites (heart a track) that are also weighted more likely to appear in generated playlists
 - Playlist generation modes:
@@ -94,20 +108,76 @@ Choose from Setuno's dark presentation or the Rekordbox-inspired color scheme.
 - Embedded audio player with click-to-seek and an extendable waveform view showing live playback
   progress, plus beat-synced auto-mix enabled by default with smooth fade and tempo curves, a
   blinking transition indicator, configurable 8-32 second transitions, and a BPM/grid match
-  toggle; optional energy matching is off by default
+  toggle; optional energy matching is off by default.
+  BPM/grid matching uses continuous varispeed (pitch follows speed), holds the matched tempo
+  through the handoff, then smoothly returns to normal over 20% of the transition duration
+  (at least two seconds). The incoming deck is not stopped, reloaded, or seeked at handoff.
 - Click the player track name to find it in the Library
 - Per-track waveform viewer with zoom/pan, BPM grid, and independent preview playback (seek and
   play a section without disturbing the main player)
+- **View > Multicolor waveforms (bass / mid / high)** toggles frequency-based colors in the
+  Library, Playlist Builder, Queue, player waveform, and waveform preview windows. Colors follow
+  the selected theme: highs use its main accent, with contrasting bass and mid colors.
+  The main waveform silhouette always uses the theme accent; a smaller inner layer shows
+  the measured frequency mix, keeping the theme dominant even on bass/mid-heavy tracks.
+  The setting is remembered.
+  Off uses a single theme accent.
+  Newly analyzed tracks cache bass/mid/high data. For older library entries, re-analyze the
+  tracks to color their mini previews; full waveforms compute this data when opened.
+- Expand the player to access eight **A-H hot cues** below the waveform. Click an empty
+  button to save the exact playback position; click a saved cue to jump without changing
+  play/pause. Saved slots are filled with their cue color and have a small top-right **x**
+  to remove the cue and free the slot. Right-click to replace or remove it. Each slot has its own color and letter
+  marker in large and mini waveforms. Cues are saved per track and preserved on re-analysis.
+  Cue edits are stored in a compact local `hot_cues.json` file without rewriting waveform data.
+  The expanded player's beat grid labels show timecodes only (no bar numbers).
+  Grid lines are spaced according to zoom: overview shows fewer bars, zooming in reveals
+  individual bars and beats.
 - Full metadata editor (title/artist/album/genre/cover art) from the Library or Playlist Builder
 - Live stats: tempo curve, energy curve, genre breakdown, totals: themed to match the active
   color scheme
-- Export: save as `.m3u` / `.m3u8` (importable in Rekordbox and similar DJ software, with tags
+- Export: save as Rekordbox XML (playlist order, metadata, BPM and key) or `.m3u` / `.m3u8`
+  (importable in Rekordbox and similar DJ software, with tags
   synced on exported copies), copy files in playlist order into a folder with numeric prefixes
   (`01 - Artist - Title.mp3`, ...), or save the playlist definition to the library
 - Remove tracks from the library without touching the files on disk
 - Duplicate detection for tracks with matching artist and title, including alternate file formats/bitrates
 - Multiple themes (dark, light, Rekordbox-style)
+- **View > Graph layout > Classical / Cluster** switches the Similarity Graph between its
+  original tempo/energy positioning and separated groups of similar audio features.
+  The choice is remembered. Both layouts hide axes and the separate artwork/details panel;
+  track playback, hover links, tooltips and right-click queue actions remain available.
+  The playing track has an enlarged green pulse and expanding halo that stays visible
+  even when another track is highlighted.
 - Local JSON library cache (no external database); re-scanning only re-analyzes new/changed files
+
+## Importing playlists into Rekordbox
+
+Choose **Export playlist...** in the Playlist Builder or **Export...** in Saved Playlists.
+The default **Rekordbox XML** format includes the ordered playlist, title, artist, album,
+genre, BPM, measured constant-tempo beat grid, musical key and A-H hot cues
+(positions, labels and colors).
+Missing audio files must be located before XML export.
+
+1. Save the `.xml` file.
+2. In Rekordbox Preferences, locate **rekordbox xml > Imported Library** (usually under
+   **Advanced > Database**, or **Bridge** in older versions) and select the exported file.
+3. Enable **rekordbox xml** in the browser sidebar via **Preferences > View** if hidden,
+   then refresh the XML library.
+4. Expand **Playlists**, right-click the exported playlist and choose **Import Playlist**.
+
+For a simpler, order-only import, choose **M3U8** in Setuno's export dialog and use
+**File > Import > Import Playlist** in Rekordbox. M3U/M3U8 does not transfer Setuno's BPM/key/hot cues.
+
+Both formats reference audio at its current location; they do not copy audio or create a
+Rekordbox USB/device library. Keep those files accessible on the importing computer.
+XML exports A-H hot cues as numbered `POSITION_MARK` entries and measured grids as `TEMPO`
+entries. It does not transfer variable-tempo grids, memory cues, or playlist covers.
+Cue/grid import support depends on the Rekordbox version.
+Rekordbox may still
+analyze imported tracks or retain existing metadata for tracks already in its collection.
+
+Format reference: [official Rekordbox XML documentation](https://rekordbox.com/en/support/developer/).
 
 ## Running from source
 
@@ -201,9 +271,7 @@ hdiutil create -volname "Setuno" -srcfolder dist/Setuno.app -ov -format UDZO dis
 
 Useful DJ/radio/curator features not yet implemented, kept here as a backlog:
 
-- **Cue points & hot cues** — save/recall intro, drop, and outro markers per track.
 - **Vocal/instrumental detection** — tag tracks as vocal, instrumental, or acapella for smarter mixing.
 - **Streaming service import** — import a Spotify/SoundCloud/Bandcamp playlist as a reference to match against the local library.
 - **Confidence score** — show a confidence indicator alongside auto-detected BPM/key for low-certainty tracks.
 - **Multiple output profiles** — export presets per target software (Rekordbox, Serato, Traktor, generic M3U) with their specific quirks/metadata.
-

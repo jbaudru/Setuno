@@ -34,7 +34,8 @@ from PySide6.QtGui import QBrush, QColor, QFont
 
 from ..core.database import Database
 
-from ..core.exporter import export_m3u, export_ordered_copies
+from ..core.exporter import export_ordered_copies
+from .playlist_export import export_playlist
 
 from ..core.playlist_engine import (
     MODE_LABELS,
@@ -453,7 +454,8 @@ class PlaylistBuilder(QWidget):
         # Export / save controls
         # ---------------------------------------------------------
 
-        self.save_m3u_btn = QPushButton(" Save as .m3u8")
+        self.save_m3u_btn = QPushButton(" Export playlist...")
+        self.save_m3u_btn.setToolTip("Export for Rekordbox (XML) or as M3U/M3U8")
         self.save_m3u_btn.setIcon(icon("save"))
 
         self.export_folder_btn = QPushButton(
@@ -698,6 +700,17 @@ class PlaylistBuilder(QWidget):
         if not playlist:
             QMessageBox.information(self, "No matches", "No tracks match these filters.")
 
+    def set_hot_cues(self, track_id, cues):
+        for track in self.current_playlist:
+            if track.id == track_id:
+                track.hot_cues = [cue.copy() for cue in cues]
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+            if item and item.data(1000) == track_id:
+                waveform = self.table.cellWidget(row, WAVEFORM_COL)
+                if isinstance(waveform, MiniWaveform):
+                    waveform.set_cues(cues)
+
     def _populate_table(self, playlist):
         self.table.blockSignals(True)
         self.table.setRowCount(len(playlist))
@@ -732,6 +745,8 @@ class PlaylistBuilder(QWidget):
             waveform = MiniWaveform(
                 t.waveform_peaks or t.waveform_low, self._wave_bass, self._wave_treble, self._wave_bg,
                 on_clicked=lambda track=t: self._show_waveform(track),
+                bands=t.waveform_bands,
+                cues=t.hot_cues, duration=t.duration,
             )
             self.table.setCellWidget(r, WAVEFORM_COL, waveform)
         self.table.blockSignals(False)
@@ -1078,13 +1093,7 @@ class PlaylistBuilder(QWidget):
     def save_m3u(self):
         if not self._ensure_files_available():
             return
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Save playlist", "playlist.m3u",
-            "M3U Playlist (*.m3u);;M3U8 Playlist (*.m3u8)",
-        )
-        if path:
-            export_m3u(self.current_playlist, path)
-            QMessageBox.information(self, "Saved", f"Playlist saved to:\n{path}\n\nImportable in Rekordbox and similar DJ software.")
+        export_playlist(self, self.current_playlist)
 
     def export_folder(self):
         if not self._ensure_files_available():

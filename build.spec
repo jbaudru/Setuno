@@ -6,8 +6,35 @@ a macOS .app bundle when run on macOS (same spec, same command, both platforms).
 Build with:  pyinstaller build.spec
 """
 import sys
+import runpy
+from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_submodules
+
+version = runpy.run_path(str(Path(SPECPATH) / "playlistbro" / "__init__.py"))["__version__"]
+windows_options = {}
+if sys.platform == "win32":
+    from PyInstaller.utils.win32.versioninfo import (
+        FixedFileInfo, StringFileInfo, StringStruct, StringTable,
+        VarFileInfo, VarStruct, VSVersionInfo,
+    )
+
+    version_tuple = tuple(int(part) for part in version.split(".")) + (0,)
+    windows_options["version"] = VSVersionInfo(
+        ffi=FixedFileInfo(filevers=version_tuple, prodvers=version_tuple),
+        kids=[
+            StringFileInfo([StringTable("040904B0", [
+                StringStruct("CompanyName", "J. Baudru (Bonoob)"),
+                StringStruct("FileDescription", "Setuno"),
+                StringStruct("FileVersion", version),
+                StringStruct("InternalName", "Setuno"),
+                StringStruct("OriginalFilename", "Setuno.exe"),
+                StringStruct("ProductName", "Setuno"),
+                StringStruct("ProductVersion", version),
+            ])]),
+            VarFileInfo([VarStruct("Translation", [1033, 1200])]),
+        ],
+    )
 
 hiddenimports = (
     collect_submodules("miniaudio")
@@ -40,6 +67,7 @@ exe = EXE(
     console=False,
     onefile=sys.platform != "darwin",  # macOS .app bundles ship as a folder, not one file
     icon="assets/icon.ico" if sys.platform != "darwin" else "assets/icon.icns",
+    **windows_options,
 )
 
 if sys.platform == "darwin":
@@ -51,8 +79,7 @@ if sys.platform == "darwin":
         info_plist={
             "CFBundleName": "Setuno",
             "CFBundleDisplayName": "Setuno",
-            "CFBundleShortVersionString": "1.3.1",
+            "CFBundleShortVersionString": version,
             "NSHighResolutionCapable": True,
         },
     )
-

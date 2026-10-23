@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
 
-from .models import Track
+from .models import HotCue, Track, validate_hot_cues
 
 
 def default_data_dir() -> Path:
@@ -27,7 +27,7 @@ def default_data_dir() -> Path:
     else:
         legacy = Path(__file__).resolve().parent.parent.parent / "data"
     if legacy != data_dir and legacy.is_dir():
-        for name in ("library.json", "playlists.json", "settings.json"):
+        for name in ("library.json", "playlists.json", "settings.json", "hot_cues.json"):
             source, destination = legacy / name, data_dir / name
             if source.is_file() and not destination.exists():
                 shutil.copy2(source, destination)
@@ -58,6 +58,8 @@ class Database:
         self.data_dir = data_dir or default_data_dir()
         self.tracks_path = self.data_dir / "library.json"
         self.playlists_path = self.data_dir / "playlists.json"
+        self.cues_path = self.data_dir / "hot_cues.json"
+        self._cue_overrides: dict[str, list[HotCue]] = {}
         self._lock = threading.RLock()
         self._tracks: dict[int, dict] = {}
         self._playlists: dict[int, dict] = {}
@@ -84,6 +86,11 @@ class Database:
                 self._playlists = {r["id"]: r for r in raw}
                 if self._playlists:
                     self._next_playlist_id = max(self._playlists) + 1
+            if self.cues_path.exists():
+                self._cue_overrides = json.loads(self.cues_path.read_text(encoding="utf-8"))
+                for record in self._tracks.values():
+                    if record["filepath"] in self._cue_overrides:
+                        record["hot_cues"] = self._cue_overrides[record["filepath"]]
             # Self-heal: older/interrupted scans could leave energy stuck at its
             # placeholder 0.0 even though energy_raw varies. Cheap to recompute on load.
             if self._tracks:
@@ -142,6 +149,8 @@ class Database:
                 "favorite": favorite,
                 "cover_path": t.cover_path, "waveform_low": t.waveform_low, "waveform_high": t.waveform_high,
                 "waveform_peaks": t.waveform_peaks,
+                "waveform_bands": t.waveform_bands,
+                "hot_cues": existing.get("hot_cues", []) if existing else validate_hot_cues(t.hot_cues, t.duration),
                 "spectral_features": t.spectral_features, "rhythmic_features": t.rhythmic_features,
             }
             self._tracks[track_id] = record
@@ -155,6 +164,20 @@ class Database:
                 return
             record["favorite"] = bool(favorite)
             self._save_tracks()
+
+    def set_hot_cues(self, track_id: int, cues: list[HotCue]):
+        with self._lock:
+            record = self._tracks[track_id]
+            validated = validate_hot_cues(cues, record.get("duration", 0))
+            overrides = {**self._cue_overrides, record["filepath"]: validated}
+            tmp = self.cues_path.with_suffix(".tmp")
+            try:
+                tmp.write_text(json.dumps(overrides, separators=(",", ":")), encoding="utf-8")
+                tmp.replace(self.cues_path)
+            finally:
+                tmp.unlink(missing_ok=True)
+            self._cue_overrides = overrides
+            self._tracks[track_id] = {**record, "hot_cues": validated}
 
     def set_manual_tempo(self, track_id: int, bpm: float):
         with self._lock:
@@ -278,6 +301,8 @@ class Database:
             cover_path=r.get("cover_path") or "",
             waveform_low=r.get("waveform_low") or [], waveform_high=r.get("waveform_high") or [],
             waveform_peaks=r.get("waveform_peaks") or [],
+            waveform_bands=r.get("waveform_bands") or [],
+            hot_cues=[{"slot": cue["slot"], "time": cue["time"]} for cue in r.get("hot_cues", [])],
             spectral_features=r.get("spectral_features") or {},
             rhythmic_features=r.get("rhythmic_features") or {},
         )
@@ -299,6 +324,23 @@ class Database:
         with self._lock:
             rows = list(self._playlists.values())
         return sorted(rows, key=lambda r: r["created_at"], reverse=True)
+
+    def update_playlist(self, playlist_id: int, name: str, cover_path: str | None = None):
+        """Update playlist presentation without changing its tracks or generation parameters."""
+        name = name.strip()
+        if not name:
+            raise ValueError("The playlist name cannot be empty.")
+        with self._lock:
+            record = self._playlists[playlist_id]
+            updated = {**record, "name": name}
+            if cover_path is not None:
+                updated["cover_path"] = cover_path
+            self._playlists[playlist_id] = updated
+            try:
+                self._save_playlists()
+            except OSError:
+                self._playlists[playlist_id] = record
+                raise
 
     def get_playlist_tracks(self, playlist_id: int) -> List[Track]:
         with self._lock:

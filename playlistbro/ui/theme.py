@@ -40,6 +40,9 @@ PALETTES = {
         "selection": "#8686AC",
         "badge": "#9a9ac2",
         "badge_text": "#33334d",
+        "wave_bass": "#ff3864",
+        "wave_mid": "#24ed80",
+        "wave_high": "#8686AC",
     },
 
     # ------------------------------------------------------------------
@@ -59,6 +62,9 @@ PALETTES = {
         "selection": "#8686AC",
         "badge": "#1677FF",
         "badge_text": "#ffffff",
+        "wave_bass": "#db1640",
+        "wave_mid": "#008c39",
+        "wave_high": "#1677FF",
     },
 
     # ------------------------------------------------------------------
@@ -78,6 +84,9 @@ PALETTES = {
     "selection": "#173A63",
     "badge": "#2F8BFF",
     "badge_text": "#ffffff",
+    "wave_bass": "#ff2424",
+    "wave_mid": "#00f050",
+    "wave_high": "#1677FF",
     },
 
     "calm": {
@@ -93,6 +102,9 @@ PALETTES = {
         "selection": "#344966",
         "badge": "#bfcc94",
         "badge_text": "#0d1821",
+        "wave_bass": "#f05c68",
+        "wave_mid": "#74baff",
+        "wave_high": "#bfcc94",
     },
     
     

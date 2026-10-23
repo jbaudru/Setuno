@@ -1,5 +1,17 @@
 # Release Log
 
+## Setuno v1.4.0
+
+- Add list/grid playlist browsing with editable names and covers, song counts, and compact icon controls.
+- Export playlists to Rekordbox XML with BPM, musical key, measured beat grids, and colored A-H hot cues.
+- Add eight persistent hot cues in the expanded player, with jump/replace/remove actions and markers in all waveforms. Save cue edits without rewriting the full waveform library.
+- Add optional theme-aware bass/mid/high waveform colors, with an accent-colored silhouette and zoom-adaptive grid density.
+- Add Classical/Cluster similarity graph layouts, remove axes and the separate artwork/details panel, and enlarge the playing-track pulse and halo.
+- Keep the incoming AutoMix deck playing through the handoff; BPM matching uses varispeed and gradually returns to normal speed afterward.
+- Improve tempo detection with a shared high-resolution onset envelope, full-track BPM refinement and attack-aligned grid phase. Improve key detection with tuning-corrected harmonic chroma sampled across the track.
+- Preserve manual BPM/key corrections in analysis and waveform previews. Key, tempo, and constant-4/4 grid estimates still require manual verification on ambiguous or variable-tempo music.
+- Include the release version in the Windows executable metadata and derive macOS bundle metadata from the application version.
+
 ## Setuno v1.3.1
 
 - Add a single library track to the current Playlist Builder playlist from its right-click menu; manually added tracks are kept by default.

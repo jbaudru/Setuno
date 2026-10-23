@@ -1,7 +1,7 @@
 """Non-modal waveform preview, shown when a track is clicked in the Library or Playlist Builder."""
 
 import numpy as np
-from PySide6.QtCore import QRectF, Qt, QThread, QUrl, Signal
+from PySide6.QtCore import QObject, QRectF, Qt, QThread, QUrl, Signal
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtWidgets import (
@@ -16,10 +16,115 @@ from PySide6.QtWidgets import (
 )
 
 from ..core.analyzer import compute_waveform_and_grid
-from ..core.models import Track
+from ..core.models import CUE_COLORS, CUE_LABELS, HotCue
 from .icon_loader import icon
+from .theme import PALETTES
 
 MINI_WAVEFORM_POINTS = 96
+
+
+class _WaveformAppearance(QObject):
+    changed = Signal()
+
+    def __init__(self):
+        super().__init__()
+        self.enabled = False
+        self.palette = PALETTES["light"]
+        self.rgb = self._palette_rgb()
+
+    def _palette_rgb(self):
+        return [QColor(self.palette[key]).getRgb()[:3]
+                for key in ("wave_bass", "wave_mid", "wave_high")]
+
+    def configure(self, theme: str, enabled: bool):
+        self.enabled = enabled
+        self.palette = PALETTES[theme]
+        self.rgb = self._palette_rgb()
+        self.changed.emit()
+
+
+waveform_appearance = _WaveformAppearance()
+
+
+def reduce_bands(bands, points: int = MINI_WAVEFORM_POINTS) -> tuple:
+    if not bands:
+        return ()
+    values = np.asarray(bands, dtype=float)
+    if len(values) > points:
+        bounds = np.linspace(0, len(values), points + 1, dtype=int)
+        values = np.add.reduceat(values, bounds[:-1], axis=0) / np.diff(bounds)[:, None]
+    return tuple(tuple(float(v) for v in row) for row in values)
+
+
+def _band_color(bands) -> QColor:
+    weights = [max(0.0, value) ** 2 for value in bands]
+    total = sum(weights)
+    if total <= 0:
+        return QColor(waveform_appearance.palette["accent_strong"])
+    rgb = [
+        round(sum(weight * color[channel] for weight, color in zip(weights, waveform_appearance.rgb)) / total)
+        for channel in range(3)
+    ]
+    return QColor(*rgb)
+
+def _paint_cues(painter, cues, width, height, start_time, end_time, mini=False):
+    if end_time <= start_time:
+        return
+    painter.save()
+    painter.setRenderHint(QPainter.Antialiasing, False)
+    font = QFont(painter.font())
+    font.setPixelSize(9 if mini else 11)
+    font.setBold(True)
+    painter.setFont(font)
+    occupied = [[], []]
+    for slot, time in cues:
+        if not start_time <= time <= end_time:
+            continue
+        x = min(width - 1, max(0.0, (time - start_time) / (end_time - start_time) * width))
+        color = QColor(CUE_COLORS[slot])
+        painter.setPen(QPen(color, 1 if mini else 2))
+        painter.drawLine(int(x), 0, int(x), int(height))
+        label_height = 11 if mini else 15
+        label_x = min(x, max(0, width - 13))
+        lane = slot % 2
+        for candidate_lane in (lane, 1 - lane):
+            candidate_x = label_x
+            for left, right in sorted(occupied[candidate_lane]):
+                if candidate_x < right and candidate_x + 13 > left:
+                    candidate_x = right + 1
+            if candidate_x + 13 <= width:
+                lane, label_x = candidate_lane, candidate_x
+                break
+        occupied[lane].append((label_x, label_x + 13))
+        box = QRectF(label_x, lane * label_height, 13, label_height)
+        painter.fillRect(box, color)
+        painter.setPen(QColor("#101018"))
+        painter.drawText(box, Qt.AlignCenter, CUE_LABELS[slot])
+    painter.restore()
+
+
+def _paint_bands(painter, values, bands, first_x, last_x, center, height, start=0.0, end=1.0):
+    """Keep the main silhouette theme-accented, with a smaller frequency-colored core."""
+    painter.save()
+    painter.setRenderHint(QPainter.Antialiasing, False)
+    n = len(values)
+    step = (last_x - first_x) / max(1, n - 1)
+    accent = QColor(waveform_appearance.palette["accent"])
+    for i, value in enumerate(values):
+        position = start + (end - start) * i / max(1, n - 1)
+        index = min(len(bands) - 1, max(0, round(position * (len(bands) - 1))))
+        color = _band_color(bands[index])
+        amplitude = value * height * 0.92
+        painter.fillRect(
+            QRectF(first_x + i * step, center - amplitude, max(1.0, step + 0.5), amplitude * 2),
+            accent,
+        )
+        painter.fillRect(
+            QRectF(first_x + i * step, center - amplitude * 0.35,
+                   max(1.0, step + 0.5), amplitude * 0.7),
+            color,
+        )
+    painter.restore()
 
 
 def reduce_peaks(peaks, points: int = MINI_WAVEFORM_POINTS) -> tuple:
@@ -36,15 +141,18 @@ def reduce_peaks(peaks, points: int = MINI_WAVEFORM_POINTS) -> tuple:
     return tuple(round(float(v), 3) for v in values)
 
 
-def _paint_mini(painter: QPainter, values, width: float, height: float, bass: QColor, treble: QColor, bg: QColor):
+def _paint_mini(painter: QPainter, values, width: float, height: float, bass: QColor, treble: QColor, bg: QColor, bands=()):
     if not values:
         return
     center = height / 2.0
+    if waveform_appearance.enabled and bands:
+        _paint_bands(painter, values, bands, 0, width, center, height * 0.43)
+        return
     low = [
         sum(values[max(0, i - 2):i + 3]) / (min(len(values), i + 3) - max(0, i - 2))
         for i in range(len(values))
     ]
-    MiniWaveform._draw_waveform(painter, values, treble, width, height * 0.43, center, top_scale=0.92)
+    MiniWaveform._draw_waveform(painter, values, bass, width, height * 0.43, center, top_scale=0.92)
     MiniWaveform._draw_waveform(painter, low, bass, width, height * 0.43, center, top_scale=0.68)
     center_color = QColor(bg)
     center_color.setAlpha(45)
@@ -56,12 +164,22 @@ class MiniWaveformDelegate(QStyledItemDelegate):
     """Paints cached low-res waveforms in a table column (no per-row widgets)."""
 
     PEAKS_ROLE = Qt.UserRole + 1
+    BANDS_ROLE = Qt.UserRole + 2
+    CUES_ROLE = Qt.UserRole + 3
+    DURATION_ROLE = Qt.UserRole + 4
     _MAX_CACHE = 5000
 
     def __init__(self, bass_color: str, treble_color: str, bg_color: str, parent=None):
         super().__init__(parent)
         self._cache: dict[tuple, QPixmap] = {}
         self.set_theme(bass_color, treble_color, bg_color)
+        waveform_appearance.changed.connect(self._appearance_changed)
+
+    def _appearance_changed(self):
+        self._cache.clear()
+        parent = self.parent()
+        if parent is not None:
+            parent.viewport().update()
 
     def set_theme(self, bass_color: str, treble_color: str, bg_color: str):
         self.bass_color = QColor(bass_color)
@@ -72,14 +190,17 @@ class MiniWaveformDelegate(QStyledItemDelegate):
     def paint(self, painter, option, index):
         super().paint(painter, option, index)
         values = index.data(self.PEAKS_ROLE)
-        if not values:
+        bands = index.data(self.BANDS_ROLE) or ()
+        cues = index.data(self.CUES_ROLE) or ()
+        duration = index.data(self.DURATION_ROLE) or 0
+        if not values and not cues:
             return
         rect = option.rect.adjusted(3, 2, -3, -2)
         height = min(26, rect.height())
         if rect.width() < 4 or height < 4:
             return
         ratio = painter.device().devicePixelRatioF() if painter.device() else 1.0
-        key = (values, rect.width(), height, ratio)
+        key = (values, bands, cues, duration, rect.width(), height, ratio)
         pixmap = self._cache.get(key)
         if pixmap is None:
             if len(self._cache) >= self._MAX_CACHE:
@@ -89,7 +210,8 @@ class MiniWaveformDelegate(QStyledItemDelegate):
             pixmap.fill(Qt.transparent)
             pix_painter = QPainter(pixmap)
             pix_painter.setRenderHint(QPainter.Antialiasing)
-            _paint_mini(pix_painter, values, rect.width(), height, self.bass_color, self.treble_color, self.bg_color)
+            _paint_mini(pix_painter, values, rect.width(), height, self.bass_color, self.treble_color, self.bg_color, bands)
+            _paint_cues(pix_painter, cues, rect.width(), height, 0, duration, mini=True)
             pix_painter.end()
             self._cache[key] = pixmap
         painter.drawPixmap(rect.x(), rect.y() + (rect.height() - height) // 2, pixmap)
@@ -106,10 +228,17 @@ class MiniWaveform(QWidget):
         bg_color: str,
         on_clicked=None,
         parent=None,
+        bands=(),
+        cues=(),
+        duration=0.0,
     ):
         super().__init__(parent)
 
         self.peaks = reduce_peaks(peaks)
+        self.bands = reduce_bands(bands)
+        self.cues = tuple((cue["slot"], cue["time"]) for cue in cues)
+        self.duration = duration
+        waveform_appearance.changed.connect(self.update)
 
         self.bass_color = QColor(bass_color)
         self.treble_color = QColor(treble_color)
@@ -121,6 +250,10 @@ class MiniWaveform(QWidget):
         self.setFixedHeight(26)
         self.setCursor(Qt.PointingHandCursor)
         self.setToolTip("Click to open the full waveform")
+
+    def set_cues(self, cues: list[HotCue]):
+        self.cues = tuple((cue["slot"], cue["time"]) for cue in cues)
+        self.update()
 
     def set_theme(
         self,
@@ -228,8 +361,10 @@ class MiniWaveform(QWidget):
 
         _paint_mini(
             painter, self.peaks, float(self.width()), float(self.height()),
-            self.bass_color, self.treble_color, self.bg_color,
+            self.bass_color, self.treble_color, self.bg_color, self.bands,
         )
+        _paint_cues(painter, self.cues, self.width(), self.height(), 0, self.duration, mini=True)
+        painter.end()
 
     def mousePressEvent(self, event):
         if (
@@ -243,17 +378,23 @@ class MiniWaveform(QWidget):
 
 class _WaveformWorker(QThread):
     done = Signal(str, list, object, object)
+    bands_ready = Signal(str, list)
 
-    def __init__(self, filepath: str, bpm: float | None):
+    def __init__(self, filepath: str, bpm: float | None, *, refine_tempo: bool = True):
         super().__init__()
         self.filepath = filepath
         self.bpm = bpm
+        self.refine_tempo = refine_tempo
 
     def run(self):
         try:
-            peaks, grid, detail = compute_waveform_and_grid(self.filepath, self.bpm)
+            bands = []
+            peaks, grid, detail = compute_waveform_and_grid(
+                self.filepath, self.bpm, waveform_bands=bands, refine_tempo=self.refine_tempo,
+            )
         except Exception:
             peaks, grid, detail = [], None, None
+            bands = []
 
         self.done.emit(
             self.filepath,
@@ -261,6 +402,7 @@ class _WaveformWorker(QThread):
             grid,
             detail,
         )
+        self.bands_ready.emit(self.filepath, bands)
 
 
 class _WaveformChart(QWidget):
@@ -272,6 +414,9 @@ class _WaveformChart(QWidget):
         super().__init__(parent)
 
         self.peaks = []
+        self.bands = []
+        self.cues = ()
+        waveform_appearance.changed.connect(self.update)
         self.detail_peaks = None
         self._normalized = []
         self.bpm = None
@@ -281,6 +426,7 @@ class _WaveformChart(QWidget):
         self._grid_offset = None
         self._grid_bpm = None
         self._bar_phase = 0
+        self.show_bar_numbers = True
         self._precise_grid = None
 
         self.bass_color = QColor(bass_color)
@@ -312,11 +458,20 @@ class _WaveformChart(QWidget):
 
     def set_peaks(self, peaks):
         self.peaks = peaks or []
+        self.bands = []
         self.detail_peaks = None
         self._normalized = self._normalize(self.peaks)
         self.zoom_factor = 1.0
         self.pan_position = 0.0
         self._sync_grid()
+        self.update()
+
+    def set_bands(self, bands):
+        self.bands = bands or []
+        self.update()
+
+    def set_cues(self, cues: list[HotCue]):
+        self.cues = tuple((cue["slot"], cue["time"]) for cue in cues)
         self.update()
 
     def set_detail_peaks(self, detail):
@@ -553,6 +708,13 @@ class _WaveformChart(QWidget):
     # Grid
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _grid_stride(px_per_beat):
+        stride = 1
+        while px_per_beat * stride < 16:
+            stride *= 2
+        return stride
+
     def _draw_grid(self, painter):
         if (
             not self.peaks
@@ -601,14 +763,16 @@ class _WaveformChart(QWidget):
         # the zoom level: sparse when the whole track is visible, and
         # progressively denser (down to one label per beat) while zooming in.
         total_beats = max(1, last - first)
-        px_per_beat = max(0.01, self.width() / total_beats)
-        min_label_spacing = fm.horizontalAdvance("000 · 00:00") + 14
+        px_per_beat = self.width() * beat_length / max(beat_length, end_time - start_time)
+        grid_stride = self._grid_stride(px_per_beat)
+        min_label_spacing = fm.horizontalAdvance("000 · 00:00" if self.show_bar_numbers else "00:00") + 14
 
         label_stride = 4
         while px_per_beat * label_stride < min_label_spacing and label_stride < total_beats:
             label_stride *= 2
 
-        for beat in range(first, last + 1):
+        first_visible_beat = first + (self._bar_phase - first) % grid_stride
+        for beat in range(first_visible_beat, last + 1, grid_stride):
 
             time = (
                 offset
@@ -627,9 +791,6 @@ class _WaveformChart(QWidget):
 
             bar_beat = beat - self._bar_phase
             is_bar = bar_beat % 4 == 0
-            if not is_bar and px_per_beat < 8:
-                continue
-
             color = QColor(grid_base)
             color.setAlpha(
                 (200 if is_bar else 90) if light_background else (150 if is_bar else 55)
@@ -650,7 +811,7 @@ class _WaveformChart(QWidget):
                 minutes = int(time // 60)
                 seconds = int(time % 60)
 
-                label = f"{bar_number} · {minutes:02d}:{seconds:02d}"
+                label = self._grid_label(bar_number, minutes, seconds)
 
                 rect = QRectF(
                     int(x) + 3,
@@ -671,6 +832,10 @@ class _WaveformChart(QWidget):
     # ------------------------------------------------------------------
     # Waveform
     # ------------------------------------------------------------------
+
+    def _grid_label(self, bar_number, minutes, seconds):
+        timecode = f"{minutes:02d}:{seconds:02d}"
+        return f"{bar_number} · {timecode}" if self.show_bar_numbers else timecode
 
     def _draw_waveform(self, painter):
         start, end = self._visible_range()
@@ -706,6 +871,18 @@ class _WaveformChart(QWidget):
             values,
             target,
         )
+        if waveform_appearance.enabled and self.bands:
+            total = max(1, len(self.peaks) - 1)
+            color_start, color_end = start / total, min(1.0, (end - 1) / total)
+            if self.detail_peaks is not None and (end - start) < width and self.track_duration:
+                color_start = d0 / max(1, n_detail - 1)
+                color_end = (d1 - 1) / max(1, n_detail - 1)
+            _paint_bands(
+                painter, values, self.bands, first_x, last_x,
+                self.height() / 2, self.height() * 0.43,
+                color_start, color_end,
+            )
+            return
 
         low = self._smooth(values, 2)
 
@@ -739,7 +916,7 @@ class _WaveformChart(QWidget):
 
         painter.setPen(Qt.NoPen)
 
-        painter.setBrush(self.treble_color)
+        painter.setBrush(self.bass_color)
         painter.drawPath(
             make_path(values, 0.92)
         )
@@ -750,7 +927,7 @@ class _WaveformChart(QWidget):
         )
 
         # Fine upper waveform detail.
-        highlight = QColor(self.treble_color)
+        highlight = QColor(self.bass_color)
         highlight.setAlpha(55)
 
         path = QPainterPath()
@@ -851,6 +1028,8 @@ class _WaveformChart(QWidget):
             )
 
             if not self.peaks:
+                _paint_cues(painter, self.cues, self.width(), self.height(),
+                            0, self.track_duration or 0)
                 return
 
             # Center line.
@@ -880,6 +1059,11 @@ class _WaveformChart(QWidget):
 
             self._draw_playhead(
                 painter
+            )
+            start, end = self._visible_range()
+            _paint_cues(
+                painter, self.cues, self.width(), self.height(),
+                self._sample_to_time(start), self._sample_to_time(end - 1),
             )
 
         finally:
@@ -1215,7 +1399,7 @@ class WaveformDialog(QDialog):
 
         bpm = self._get_track_bpm(track)
         duration = self._get_track_duration(track)
-        grid_key = (track.filepath, bpm)
+        grid_key = (track.filepath, bpm, not track.tempo_manual)
 
         self.chart.set_beat_grid(self._grid_cache.get(grid_key))
         self.chart.set_bpm(bpm)
@@ -1228,15 +1412,19 @@ class WaveformDialog(QDialog):
         )
 
         self.chart.set_peaks(getattr(track, "waveform_peaks", []))
+        self.chart.set_bands(track.waveform_bands)
+        self.chart.set_cues(track.hot_cues)
 
         worker = _WaveformWorker(
             track.filepath,
             bpm,
+            refine_tempo=not track.tempo_manual,
         )
 
         worker.done.connect(
             self._on_peaks
         )
+        worker.bands_ready.connect(self._on_bands)
 
         worker.finished.connect(
             lambda: self._active_workers.discard(
@@ -1254,13 +1442,18 @@ class WaveformDialog(QDialog):
         self.activateWindow()
 
     def _on_peaks(self, filepath, peaks, grid, detail=None):
-        if grid and isinstance(self.sender(), _WaveformWorker):
-            self._grid_cache[(filepath, self.sender().bpm)] = grid
+        worker = self.sender()
+        if grid and isinstance(worker, _WaveformWorker):
+            self._grid_cache[(filepath, worker.bpm, worker.refine_tempo)] = grid
         if filepath == self._current_filepath:
             if len(self.chart.peaks) < 2400 and peaks:
                 self.chart.set_peaks(peaks)
             self.chart.set_detail_peaks(detail)
             self.chart.set_beat_grid(grid)
+
+    def _on_bands(self, filepath, bands):
+        if filepath == self._current_filepath:
+            self.chart.set_bands(bands)
 
     def _seek_preview(self, seconds: float):
         if not self._current_filepath:

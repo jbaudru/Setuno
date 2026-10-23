@@ -35,7 +35,7 @@ class PlayerWidgetTests(unittest.TestCase):
         self.assertAlmostEqual(fade_end[1], 1.0)
         self.assertAlmostEqual(_transition_playback_rate(0.0, 1.2), 1.0)
         self.assertAlmostEqual(_transition_playback_rate(0.5, 1.2), 1.2)
-        self.assertAlmostEqual(_transition_playback_rate(1.0, 1.2), 1.0)
+        self.assertAlmostEqual(_transition_playback_rate(1.0, 1.2), 1.2)
 
     def test_transition_plan_aligns_beats_and_matches_local_energy(self):
         outgoing = Track(
@@ -106,10 +106,12 @@ class PlayerWidgetTests(unittest.TestCase):
 
         self.assertEqual(plan.duration_ms, 8250)
 
-    def test_transition_completion_restores_normal_playback_rate(self):
+    def test_transition_completion_keeps_incoming_deck_running_and_starts_tempo_recovery(self):
         outgoing_player = SimpleNamespace(stop=_Calls())
         incoming_player = SimpleNamespace(
             position=lambda: 5000, duration=lambda: 120000,
+            playbackRate=lambda: 1.2, setPlaybackRate=_Calls(),
+            stop=_Calls(), pause=_Calls(), setSource=_Calls(), setPosition=_Calls(),
         )
         outgoing_output = SimpleNamespace(setVolume=_Calls())
         incoming_output = SimpleNamespace(setVolume=_Calls())
@@ -137,6 +139,8 @@ class PlayerWidgetTests(unittest.TestCase):
             time_label=SimpleNamespace(setText=_Calls()),
             waveform_chart=SimpleNamespace(set_playhead=_Calls()),
             track_transitioned=SimpleNamespace(emit=_Calls()),
+            _tempo_restore_timer=SimpleNamespace(start=_Calls()),
+            _tempo_restore_elapsed=SimpleNamespace(start=_Calls()),
         )
         widget._sync_progress_from_player = lambda player: PlayerWidget._sync_progress_from_player(widget, player)
 
@@ -148,6 +152,43 @@ class PlayerWidgetTests(unittest.TestCase):
         self.assertEqual(widget.position_slider.setValue.calls, [(5000,)])
         self.assertEqual(widget.waveform_chart.set_playhead.calls, [(5.0,)])
         self.assertIs(widget.current_track, track)
+        self.assertEqual(widget._tempo_restore_timer.start.calls, [()])
+        self.assertEqual(widget._tempo_restore_duration_ms, 3200)
+        self.assertEqual(widget._tempo_restore_rate, 1.2)
+        for operation in ("stop", "pause", "setSource", "setPosition", "setPlaybackRate"):
+            self.assertEqual(getattr(incoming_player, operation).calls, [], operation)
+
+    def test_post_transition_tempo_returns_smoothly_to_exact_normal_rate(self):
+        for matched_rate in (0.8, 1.2):
+            changes = []
+            widget = SimpleNamespace(
+                _tempo_restore_elapsed=SimpleNamespace(restart=lambda: 100),
+                _tempo_restore_progress_ms=0,
+                _tempo_restore_duration_ms=3200,
+                _tempo_restore_rate=matched_rate,
+                _tempo_restore_timer=SimpleNamespace(stop=_Calls()),
+                _is_playing=lambda: True,
+                player=SimpleNamespace(
+                    playbackRate=lambda: changes[-1] if changes else matched_rate,
+                    setPlaybackRate=changes.append,
+                ),
+            )
+            for _ in range(32):
+                PlayerWidget._advance_tempo_restore(widget)
+            self.assertEqual(changes[-1], 1.0)
+            self.assertEqual(widget._tempo_restore_timer.stop.calls, [()])
+            direction = 1 if matched_rate < 1 else -1
+            self.assertTrue(all((b-a)*direction >= 0 for a,b in zip(changes,changes[1:])))
+            self.assertLess(max(abs(b-a) for a,b in zip(changes,changes[1:])), 0.01)
+
+    def test_tempo_recovery_does_not_advance_while_paused(self):
+        widget = SimpleNamespace(
+            _tempo_restore_elapsed=SimpleNamespace(restart=lambda: 100),
+            _tempo_restore_progress_ms=500,
+            _is_playing=lambda: False,
+        )
+        PlayerWidget._advance_tempo_restore(widget)
+        self.assertEqual(widget._tempo_restore_progress_ms, 500)
 
     def test_short_track_requests_auto_mix_when_playback_starts(self):
         emitted = _Calls()

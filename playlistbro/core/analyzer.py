@@ -10,6 +10,7 @@ fast middle tier for tempo when librosa isn't available.
 """
 
 import hashlib
+import logging
 import os
 from pathlib import Path
 
@@ -18,6 +19,8 @@ from numpy.lib.stride_tricks import sliding_window_view
 
 from .camelot import normalize_key_name, key_to_camelot
 from .database import default_data_dir
+
+logger = logging.getLogger(__name__)
 
 
 # Formats miniaudio can decode natively.
@@ -67,8 +70,8 @@ FRAME_SIZE = 1024
 HOP_SIZE = 128
 
 # A second resolution is useful for tempo refinement.
-TEMPO_FRAME_SIZE = 8192
-TEMPO_HOP_SIZE = 2048
+TEMPO_FRAME_SIZE = 1024
+TEMPO_HOP_SIZE = 256
 
 MIN_BPM, MAX_BPM = 80, 200
 
@@ -320,7 +323,8 @@ def clear_cover_art(filepath: str) -> str:
 # Audio decoding
 # ---------------------------------------------------------------------------
 
-def _decode_audio(filepath: str):
+def _decode_audio(filepath: str, waveform_bands: list | None = None,
+                  full_audio: list | None = None):
     """Decode filepath to mono float32 PCM at ANALYSIS_SR."""
     import miniaudio
 
@@ -337,6 +341,10 @@ def _decode_audio(filepath: str):
     )
 
     full_duration = len(samples) / float(ANALYSIS_SR)
+    if full_audio is not None:
+        full_audio.append(samples)
+    if waveform_bands is not None:
+        waveform_bands.extend(compute_waveform_colors(samples, ANALYSIS_SR))
     window_start = 0.0
 
     if full_duration > ANALYSIS_MAX_SECONDS:
@@ -1242,11 +1250,7 @@ def _estimate_tempo(
         ):
             return -np.inf
 
-        p = np.arange(
-            lag,
-            len(x) - 1,
-            lag,
-        )
+        p = np.arange(np.ceil(lag), len(x) - 1) - lag
 
         if len(p) < 4:
             return -np.inf
@@ -1264,7 +1268,7 @@ def _estimate_tempo(
 
         return float(
             np.mean(
-                x[i] * v
+                x[np.arange(int(np.ceil(lag)), len(x) - 1)] * v
             )
         )
 
@@ -1960,17 +1964,21 @@ def _estimate_tempo_librosa(y: np.ndarray, sr: int, beat_grid=None, window_start
     """
     try:
         import librosa
-    except Exception:
+    except ImportError:
         return None
 
     try:
         y32 = y.astype(np.float32)
+        if len(y32) < sr * 4 or np.max(np.abs(y32)) < 1e-5:
+            return None
+        hop = 256
+        onset = librosa.onset.onset_strength(y=y32, sr=sr, hop_length=hop)
 
         # Global beat-tracking estimate: dynamic programming over the full
         # onset envelope, generally the single most reliable number librosa
         # can give.
         tempo_bt, beat_frames = librosa.beat.beat_track(
-            y=y32, sr=sr, start_bpm=120.0, tightness=100,
+            onset_envelope=onset, sr=sr, hop_length=hop, start_bpm=120.0, tightness=100,
         )
         tempo_bt = float(np.asarray(tempo_bt).reshape(-1)[0])
 
@@ -1978,10 +1986,12 @@ def _estimate_tempo_librosa(y: np.ndarray, sr: int, beat_grid=None, window_start
         # cross-check: if it disagrees with the beat-tracker estimate by
         # close to a factor of 2, that's the signature of an octave error.
         local_tempi = librosa.feature.tempo(
-            y=y32, sr=sr, aggregate=None, start_bpm=120.0, max_tempo=MAX_BPM,
+            onset_envelope=onset, sr=sr, hop_length=hop,
+            aggregate=None, start_bpm=120.0, max_tempo=MAX_BPM,
         )
         tempo_local = float(np.median(local_tempi)) if len(local_tempi) else tempo_bt
-    except Exception:
+    except (ValueError, RuntimeError, FloatingPointError):
+        logger.warning("Librosa tempo analysis failed; using fallback detector", exc_info=True)
         return None
 
     if not np.isfinite(tempo_bt) or tempo_bt <= 0:
@@ -2006,7 +2016,7 @@ def _estimate_tempo_librosa(y: np.ndarray, sr: int, beat_grid=None, window_start
         bpm /= 2.0
 
     if beat_grid is not None and len(beat_frames) >= 4:
-        beat_times = librosa.frames_to_time(beat_frames, sr=sr)
+        beat_times = librosa.frames_to_time(beat_frames, sr=sr, hop_length=hop)
         indices = np.arange(len(beat_times))
         period, phase = np.polyfit(indices, beat_times, 1)
         residual = np.median(np.abs(beat_times - (period * indices + phase)))
@@ -2027,7 +2037,7 @@ def _estimate_tempo_aubio(y: np.ndarray, sr: int):
     """
     try:
         import aubio
-    except Exception:
+    except ImportError:
         return None
 
     try:
@@ -2045,7 +2055,8 @@ def _estimate_tempo_aubio(y: np.ndarray, sr: int):
             detector(chunk)
 
         bpm = float(detector.get_bpm())
-    except Exception:
+    except (ValueError, RuntimeError, FloatingPointError):
+        logger.warning("Aubio tempo analysis failed; using spectral fallback", exc_info=True)
         return None
 
     if not np.isfinite(bpm) or bpm <= 0:
@@ -2073,26 +2084,37 @@ def _detect_key_librosa(y: np.ndarray, sr: int):
 
     try:
         import librosa
-    except Exception:
+    except ImportError:
         return None
 
     try:
-        y32 = y.astype(np.float32)
-        harmonic = librosa.effects.harmonic(y32, margin=8.0)
-
-        chroma = librosa.feature.chroma_cqt(
-            y=harmonic,
-            sr=sr,
-            hop_length=KEY_HOP_SIZE,
-        )
-    except Exception:
+        frames = []
+        window = min(len(y), sr * 16)
+        starts = np.linspace(0, max(0, len(y) - window),
+                             min(3, max(1, len(y) // window)), dtype=int)
+        for start in starts:
+            section = np.asarray(y[start:start + window], dtype=np.float32)
+            if np.max(np.abs(section)) < 1e-5:
+                continue
+            harmonic = librosa.effects.harmonic(section, margin=8.0)
+            if np.sum(harmonic ** 2) < 0.01 * np.sum(section ** 2):
+                continue
+            tuning = librosa.estimate_tuning(y=harmonic, sr=sr, bins_per_octave=36)
+            chroma = librosa.feature.chroma_cqt(
+                y=harmonic, sr=sr, hop_length=KEY_HOP_SIZE, tuning=tuning,
+            ).T
+            strength = np.linalg.norm(chroma, axis=1)
+            tonal = chroma[strength > max(1e-6, float(strength.max()) * 0.1)]
+            if len(tonal):
+                frames.append(tonal)
+    except (ValueError, RuntimeError, FloatingPointError):
+        logger.warning("Librosa key analysis failed; using spectral fallback", exc_info=True)
         return None
 
-    frames = chroma.T  # (n_frames, 12), pitch class 0 = C, matching NOTE_NAMES
-
-    fallback_chroma = frames.mean(axis=0) if frames.shape[0] else np.zeros(12)
-
-    return _vote_key_from_chroma_segments(frames, fallback_chroma)
+    if not frames:
+        return ""
+    chroma_frames = np.concatenate(frames)
+    return _vote_key_from_chroma_segments(chroma_frames, chroma_frames.mean(axis=0))
 
 
 # ---------------------------------------------------------------------------
@@ -3263,7 +3285,87 @@ def _compute_waveform_bands(
 # Main analysis
 # ---------------------------------------------------------------------------
 
-def analyze_file(filepath: str) -> dict:
+def compute_waveform_colors(y: np.ndarray, sr: int, num_points: int = 2400) -> list:
+    """Measure real bass (<195 Hz), mid and high (>6 kHz) content on a fixed timeline."""
+    if len(y) == 0:
+        return []
+    frame_size = 2048
+    window = np.hanning(frame_size).astype(np.float32)
+    frequencies = np.fft.rfftfreq(frame_size, 1.0 / sr)
+    masks = (
+        frequencies < WAVEFORM_LOW_HZ,
+        (frequencies >= WAVEFORM_LOW_HZ) & (frequencies <= WAVEFORM_HIGH_HZ),
+        frequencies > WAVEFORM_HIGH_HZ,
+    )
+    bands = []
+    for center in np.linspace(0, len(y) - 1, num_points, dtype=int):
+        start = int(center) - frame_size // 2
+        frame = y[max(0, start):min(len(y), start + frame_size)]
+        if len(frame) < frame_size:
+            frame = np.pad(frame, (max(0, -start), max(0, start + frame_size - len(y))))
+        spectrum = np.abs(np.fft.rfft(frame * window))
+        bands.append([float(spectrum[mask].sum()) for mask in masks])
+    values = np.asarray(bands)
+    maximum = float(values.max())
+    if maximum > 0:
+        values /= maximum
+    return np.round(values, 5).tolist()
+
+
+def _analyze_timing(samples: np.ndarray, tempo_override: float | None = None) -> tuple[float, float | None]:
+    if not len(samples) or np.max(np.abs(samples)) < 1e-5:
+        return (tempo_override or 0.0), None
+    window_size = ANALYSIS_SR * ANALYSIS_MAX_SECONDS
+    start = max(0, (len(samples) - window_size) // 2)
+    window = samples[start:start + window_size]
+    beat_grid = {}
+    tempo = tempo_override if tempo_override is not None else _estimate_tempo_librosa(
+        window, ANALYSIS_SR, beat_grid=beat_grid, window_start=start / ANALYSIS_SR,
+    )
+    if tempo is None:
+        tempo = _estimate_tempo_aubio(window, ANALYSIS_SR)
+    if tempo is None:
+        mag = _stft_magnitude(window, TEMPO_FRAME_SIZE, TEMPO_HOP_SIZE)
+        kick = _tempo_onset_envelope(mag, ANALYSIS_SR, TEMPO_FRAME_SIZE, 40.0, 160.0)
+        snare = _tempo_onset_envelope(mag, ANALYSIS_SR, TEMPO_FRAME_SIZE, 150.0, 4000.0)
+        tempo = _estimate_tempo(_combine_beat_envelopes(kick, snare), ANALYSIS_SR, TEMPO_HOP_SIZE)
+    tempo = float(np.clip(tempo, MIN_BPM, MAX_BPM)) if tempo_override is None else tempo_override
+    grid = compute_beat_grid(samples, ANALYSIS_SR, tempo, refine_tempo=tempo_override is None)
+    if grid is not None:
+        return grid["bpm"], grid["offset"]
+    return tempo, beat_grid.get("offset")
+
+
+def _analyze_key(samples: np.ndarray) -> str:
+    key = _detect_key_librosa(samples, ANALYSIS_SR)
+    if key is not None:
+        return key
+    window = min(len(samples), ANALYSIS_SR * ANALYSIS_MAX_SECONDS)
+    start = max(0, (len(samples) - window) // 2)
+    mag = _stft_magnitude(samples[start:start + window], KEY_FRAME_SIZE, KEY_HOP_SIZE)
+    return _detect_key_from_stft(mag, ANALYSIS_SR, KEY_FRAME_SIZE)
+
+
+def analyze_timing_and_key(filepath: str, tempo_override: float | None = None) -> dict:
+    """Recompute timing/key only, without changing tags, covers, cues or waveforms."""
+    import miniaudio
+
+    if tempo_override is not None and (not np.isfinite(tempo_override) or tempo_override <= 0):
+        raise ValueError("Manual tempo must be finite and positive")
+    decoded = miniaudio.decode_file(
+        filepath, output_format=miniaudio.SampleFormat.FLOAT32,
+        nchannels=1, sample_rate=ANALYSIS_SR,
+    )
+    samples = np.frombuffer(bytes(decoded.samples), dtype=np.float32)
+    if not len(samples):
+        raise ValueError(f"No audio decoded: {filepath}")
+    tempo, offset = _analyze_timing(samples, tempo_override)
+    key = _analyze_key(samples)
+    return {"tempo": round(tempo, 2), "beat_offset": offset,
+            "key_name": key, "camelot": key_to_camelot(key)}
+
+
+def analyze_file(filepath: str, *, tempo_override: float | None = None) -> dict:
     """Analyze a single audio file.
 
     Returns a dict compatible with the existing Track fields, with the
@@ -3274,8 +3376,10 @@ def analyze_file(filepath: str) -> dict:
         filepath
     )
 
-    y, full_duration, waveform_peaks, window_start = _decode_audio(
-        filepath
+    waveform_bands = []
+    full_audio = []
+    y, full_duration, waveform_peaks, _window_start = _decode_audio(
+        filepath, waveform_bands, full_audio
     )
     silent = not len(y) or np.max(np.abs(y)) < 1e-5
 
@@ -3290,61 +3394,10 @@ def analyze_file(filepath: str) -> dict:
         HOP_SIZE,
     )
 
-    # Prefer librosa's dynamic-programming beat tracker when available; it
-    # is considerably more robust than the hand-rolled autocorrelation
-    # fallback below. If librosa isn't installed, try aubio next: a fast,
-    # small C library that's still noticeably more reliable than the plain
-    # NumPy autocorrelation tier. Only if neither is installed do we fall
-    # all the way back to the dedicated kick/snare onset analysis.
-    beat_grid = {}
-    tempo = 0.0 if silent else _estimate_tempo_librosa(
-        y, ANALYSIS_SR, beat_grid=beat_grid, window_start=window_start,
-    )
-
-    if tempo is None:
-        tempo = _estimate_tempo_aubio(y, ANALYSIS_SR)
-
-    if tempo is None:
-        # Dedicated beat-resolution STFT.
-        tempo_mag = _stft_magnitude(
-            y,
-            TEMPO_FRAME_SIZE,
-            TEMPO_HOP_SIZE,
-        )
-
-        # Kick: fundamental + low harmonics.
-        # This is the primary BPM signal.
-        kick_onset = _tempo_onset_envelope(
-            tempo_mag,
-            ANALYSIS_SR,
-            TEMPO_FRAME_SIZE,
-            40.0,
-            160.0,
-        )
-
-        # Snare/clap: higher-frequency transient information.
-        # Useful for confirming the beat and distinguishing subdivisions.
-        snare_onset = _tempo_onset_envelope(
-            tempo_mag,
-            ANALYSIS_SR,
-            TEMPO_FRAME_SIZE,
-            150.0,
-            4000.0,
-        )
-
-        # Kick dominates the BPM estimate.
-        beat_onset = _combine_beat_envelopes(
-            kick_onset,
-            snare_onset,
-        )
-
-        tempo = _estimate_tempo(
-            beat_onset,
-            ANALYSIS_SR,
-            TEMPO_HOP_SIZE,
-        )
-
-    tempo = float(np.clip(tempo, MIN_BPM, MAX_BPM)) if tempo else 0.0
+    samples = full_audio[0] if full_audio else y
+    if tempo_override is not None and (not np.isfinite(tempo_override) or tempo_override <= 0):
+        raise ValueError("Manual tempo must be finite and positive")
+    tempo, beat_offset = _analyze_timing(samples, tempo_override)
 
     # General onset envelope is still used for genre/rhythmic features.
     onset_env = _onset_envelope(
@@ -3358,20 +3411,7 @@ def analyze_file(filepath: str) -> dict:
     # Same idea as tempo: librosa's constant-Q chroma (computed on the
     # harmonic-separated signal) is a better basis for key detection than
     # our plain-STFT chroma, when it's available.
-    key_name = _detect_key_librosa(y, ANALYSIS_SR)
-
-    if key_name is None:
-        key_mag = _stft_magnitude(
-            y,
-            KEY_FRAME_SIZE,
-            KEY_HOP_SIZE,
-        )
-
-        key_name = _detect_key_from_stft(
-            key_mag,
-            ANALYSIS_SR,
-            KEY_FRAME_SIZE,
-        )
+    key_name = _analyze_key(samples)
 
     camelot = key_to_camelot(
         key_name
@@ -3539,7 +3579,7 @@ def analyze_file(filepath: str) -> dict:
             full_duration
         ),
         "tempo": round(tempo, 2),
-        "beat_offset": beat_grid.get("offset"),
+        "beat_offset": beat_offset,
         "key_name": key_name,
         "camelot": camelot,
 
@@ -3560,6 +3600,7 @@ def analyze_file(filepath: str) -> dict:
         "waveform_low": waveform_low,
         "waveform_high": waveform_high,
         "waveform_peaks": waveform_peaks,
+        "waveform_bands": waveform_bands,
         "spectral_features": spectral,
         "rhythmic_features": rhythmic,
 
@@ -3594,15 +3635,22 @@ def compute_waveform_peaks(
     return _downsample_waveform_peaks(samples, num_points)
 
 
-def compute_beat_grid(samples: np.ndarray, sr: int, bpm: float) -> dict | None:
+def compute_beat_grid(samples: np.ndarray, sr: int, bpm: float, *,
+                      refine_tempo: bool = True) -> dict | None:
     """Lock a beat grid onto the kicks of the full track.
 
     Fine-tunes the BPM (+/-1.5%) and phase on a low-band onset envelope, then picks
     the downbeat as the beat where section changes (low-band energy jumps) land.
     Returns {"bpm", "offset"} with `offset` on a downbeat, or None.
     """
-    if not bpm or bpm <= 0 or len(samples) < sr * 4:
+    if (not bpm or not np.isfinite(bpm) or bpm <= 0 or sr <= 0
+            or len(samples) < sr * 4 or not np.all(np.isfinite(samples))):
         return None
+    if np.max(np.abs(samples)) < 1e-5:
+        return None
+    block = max(1, round(sr * 0.003))
+    usable = len(samples) // block * block
+    power = np.mean(samples[:usable].reshape(-1, block) ** 2, axis=1)
 
     decim = 8
     x = samples[: len(samples) // decim * decim].reshape(-1, decim).mean(axis=1)
@@ -3617,26 +3665,79 @@ def compute_beat_grid(samples: np.ndarray, sr: int, bpm: float) -> dict | None:
     max_bin = max(2, int(150 * n_fft / sr2))
     mag = np.abs(np.fft.rfft(frames * np.hanning(n_fft), axis=1))[:, 1:max_bin + 1]
     log_mag = np.log1p(100.0 * mag)
+    flatness = np.exp(np.mean(np.log(mag + 1e-12), axis=1)) / (np.mean(mag, axis=1) + 1e-12)
+    if np.median(flatness) > 0.8 and np.std(power) < 0.3 * np.mean(power):
+        return None
     onset = np.maximum(0.0, np.diff(log_mag, axis=0, prepend=log_mag[:1])).sum(axis=1)
     times = (np.arange(count) * hop + n_fft / 2) / sr2
     duration = len(samples) / sr
+    peaks = np.flatnonzero(
+        (onset[1:-1] > onset[:-2]) & (onset[1:-1] >= onset[2:])
+        & (onset[1:-1] > max(1e-8, np.percentile(onset, 75)))
+    ) + 1
+    if len(peaks) < 8:
+        return None
+    peak_times = times[peaks]
+    weights = np.minimum(onset[peaks], np.percentile(onset[peaks], 90))
 
     bins = 240
     best = (-1.0, bpm, 0.0)
-    for candidate in bpm * (1.0 + np.linspace(-0.015, 0.015, 301)):
-        period = 60.0 / candidate
-        idx = ((times % period) / period * bins).astype(int) % bins
-        hist = np.bincount(idx, weights=onset, minlength=bins)
-        hist = hist + 0.5 * (np.roll(hist, 1) + np.roll(hist, -1))
-        peak = int(np.argmax(hist))
-        score = hist[peak] / (hist.mean() + 1e-9)
-        if score > best[0]:
-            left, right = hist[peak - 1], hist[(peak + 1) % bins]
-            denom = left - 2 * hist[peak] + right
-            shift = 0.5 * (left - right) / denom if denom else 0.0
-            best = (score, float(candidate), ((peak + 0.5 + shift) / bins) * period)
+    center = bpm
+    searches = ((0.015, 121), (0.00025, 81)) if refine_tempo else ((0.0, 1),)
+    for radius, steps in searches:
+        for candidate in center * (1.0 + np.linspace(-radius, radius, steps)):
+            period = 60.0 / candidate
+            idx = ((peak_times % period) / period * bins).astype(int) % bins
+            hist = np.bincount(idx, weights=weights, minlength=bins)
+            hist = hist + 0.5 * (np.roll(hist, 1) + np.roll(hist, -1))
+            peak = int(np.argmax(hist))
+            score = hist[peak] / (hist.mean() + 1e-9)
+            if score > best[0]:
+                left, right = hist[peak - 1], hist[(peak + 1) % bins]
+                denom = left - 2 * hist[peak] + right
+                shift = 0.5 * (left - right) / denom if denom else 0.0
+                best = (score, float(candidate), ((peak + 0.5 + shift) / bins) * period)
+        center = best[1]
     _score, bpm, phase = best
+    if _score < 1.7:
+        return None
     period = 60.0 / bpm
+
+    # Spectral-flux windows lead the physical attack. Fit actual energy rises
+    # near the coarse grid so the exported phase and long-track BPM agree.
+    rises = np.maximum(0.0, np.diff(power, prepend=power[0]))
+    attacks = np.flatnonzero((rises[1:-1] > rises[:-2]) & (rises[1:-1] >= rises[2:])) + 1
+    attack_times = attacks * block / sr
+    beat_numbers = np.rint((attack_times - phase) / period)
+    residual = attack_times - (phase + beat_numbers * period)
+    threshold = max(1e-12, float(np.percentile(rises[attacks], 60))) if len(attacks) else 1e-12
+    valid = ((np.abs(residual) < min(0.045, period * 0.1))
+             & (rises[attacks] > threshold))
+    if np.count_nonzero(valid) >= 8:
+        numbers, attacks_t = beat_numbers[valid], attack_times[valid]
+        strengths = rises[attacks[valid]]
+        order = np.lexsort((strengths, numbers))
+        last_per_beat = np.r_[numbers[order][1:] != numbers[order][:-1], True]
+        chosen = order[last_per_beat]
+        numbers, attacks_t = numbers[chosen], attacks_t[chosen]
+        if len(numbers) < 8:
+            return None
+        for _ in range(3):
+            fitted_period, fitted_phase = np.polyfit(numbers, attacks_t, 1)
+            errors = attacks_t - (fitted_phase + fitted_period * numbers)
+            keep = np.abs(errors - np.median(errors)) <= max(
+                0.006, 3 * float(np.median(np.abs(errors - np.median(errors))))
+            )
+            if np.count_nonzero(keep) < 8:
+                break
+            numbers, attacks_t = numbers[keep], attacks_t[keep]
+        if abs(fitted_period / period - 1) < 0.002:
+            if refine_tempo:
+                period = float(fitted_period)
+                bpm = 60.0 / period
+                phase = float(fitted_phase % period)
+            else:
+                phase = float(np.median(attacks_t - numbers * period) % period)
 
     energy = log_mag.mean(axis=1)
     beat_times = np.arange(phase, duration, period)
@@ -3650,7 +3751,8 @@ def compute_beat_grid(samples: np.ndarray, sr: int, bpm: float) -> dict | None:
 
 
 def compute_waveform_and_grid(filepath: str, bpm: float | None, num_points: int = 2400,
-                              detail_rate: int = 500):
+                              detail_rate: int = 500, waveform_bands: list | None = None,
+                              *, refine_tempo: bool = True):
     """Decode once and return (waveform peaks, beat grid or None, detail peaks at `detail_rate`/s)."""
     import miniaudio
 
@@ -3661,7 +3763,9 @@ def compute_waveform_and_grid(filepath: str, bpm: float | None, num_points: int 
         sample_rate=ANALYSIS_SR,
     )
     samples = np.frombuffer(bytes(decoded.samples), dtype=np.float32)
-    grid = compute_beat_grid(samples, ANALYSIS_SR, bpm) if bpm else None
+    if waveform_bands is not None:
+        waveform_bands.extend(compute_waveform_colors(samples, ANALYSIS_SR, num_points))
+    grid = compute_beat_grid(samples, ANALYSIS_SR, bpm, refine_tempo=refine_tempo) if bpm else None
     block = max(1, ANALYSIS_SR // detail_rate)
     usable = len(samples) // block * block
     if usable:

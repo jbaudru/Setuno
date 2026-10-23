@@ -24,6 +24,7 @@ from .player_widget import (
 )
 from .playlist_builder import PlaylistBuilder
 from .playlists_view import SavedPlaylistsView
+from .waveform_view import waveform_appearance
 from .queue_view import QueueView
 from .theme import PALETTES, build_stylesheet, icon_color
 
@@ -95,6 +96,7 @@ class MainWindow(QMainWindow):
         self.active_source: str | None = None  # 'library' or 'builder': where the current track came from
 
         self.player = PlayerWidget(
+            db=self.db,
             auto_mix=bool(self.settings.get("auto_mix", True)),
             bpm_sync=bool(self.settings.get("auto_mix_bpm_sync", True)),
             energy_match=bool(self.settings.get("auto_mix_energy_match", False)),
@@ -135,12 +137,16 @@ class MainWindow(QMainWindow):
             is_track_played=lambda track_id: track_id in self.played_track_ids,
         )
         self.saved_playlists_view = SavedPlaylistsView(self.db, on_open=self._open_saved_playlist)
+        self.saved_playlists_view.set_view_mode(self.settings.get("playlists_view_mode", "list"))
+        self.saved_playlists_view.view_mode_changed.connect(self._set_playlists_view_mode)
         self.graph_view = SimilarityGraphView(
             self.db, on_play_track=lambda t: self._on_track_played("graph", t),
             on_queue_track=self._add_to_queue,
         )
         self.graph_view.set_played_ids(self.played_track_ids)
+        self.graph_view.set_layout_mode(self.settings.get("graph_layout", "classical"))
         self.player.favorite_toggled.connect(self._on_player_favorite_toggled)
+        self.player.cues_changed.connect(self._on_cues_changed)
         self.library_view.on_favorite_changed = self._on_list_favorite_changed
         self.playlist_builder.on_favorite_changed = self._on_list_favorite_changed
 
@@ -272,6 +278,21 @@ class MainWindow(QMainWindow):
         self.meter_action.setCheckable(True)
         self.meter_action.setChecked(bool(self.settings.get("show_level_meter", True)))
         self.meter_action.toggled.connect(self._set_level_meter_visible)
+        self.multicolor_waveform_action = view_menu.addAction("Multicolor waveforms (bass / mid / high)")
+        self.multicolor_waveform_action.setCheckable(True)
+        self.multicolor_waveform_action.setChecked(bool(self.settings.get("multicolor_waveforms", False)))
+        self.multicolor_waveform_action.toggled.connect(self._set_multicolor_waveforms)
+        graph_menu = view_menu.addMenu("Graph layout")
+        graph_group = QActionGroup(self)
+        graph_group.setExclusive(True)
+        self.graph_layout_actions = {}
+        for mode, label in (("classical", "Classical"), ("cluster", "Cluster")):
+            action = graph_menu.addAction(label)
+            action.setCheckable(True)
+            action.setChecked(self.graph_view.layout_mode == mode)
+            graph_group.addAction(action)
+            action.triggered.connect(lambda _checked, mode=mode: self._set_graph_layout(mode))
+            self.graph_layout_actions[mode] = action
         theme_menu = view_menu.addMenu("Theme")
         theme_group = QActionGroup(self)
         theme_group.setExclusive(True)
@@ -334,6 +355,10 @@ class MainWindow(QMainWindow):
     def _set_auto_mix(self, enabled: bool):
         self.player.crossfade_btn.setChecked(enabled)
         self.settings["auto_mix"] = enabled
+        save_settings(self.settings)
+
+    def _set_playlists_view_mode(self, mode: str):
+        self.settings["playlists_view_mode"] = mode
         save_settings(self.settings)
 
     def _set_energy_match(self, enabled: bool):
@@ -400,6 +425,7 @@ class MainWindow(QMainWindow):
     def _apply_theme(self, mode: str, persist: bool = True):
         self.theme = mode
         palette = PALETTES[mode]
+        waveform_appearance.configure(mode, bool(self.settings.get("multicolor_waveforms", False)))
         QApplication.instance().setStyleSheet(build_stylesheet(mode))
         icon_loader.set_theme_color(palette["icon"])
         self.queue_tab_btn.setIcon(icon_loader.icon("list"))
@@ -434,6 +460,16 @@ class MainWindow(QMainWindow):
         self.settings["show_level_meter"] = visible
         save_settings(self.settings)
 
+    def _set_multicolor_waveforms(self, enabled: bool):
+        self.settings["multicolor_waveforms"] = enabled
+        waveform_appearance.configure(self.theme, enabled)
+        save_settings(self.settings)
+
+    def _set_graph_layout(self, mode: str):
+        self.graph_view.set_layout_mode(mode)
+        self.settings["graph_layout"] = mode
+        save_settings(self.settings)
+
     def _on_tab_changed(self, index: int):
         self.queue_tab_btn.setChecked(self.tabs.widget(index) is self.queue_view)
         if self.tabs.widget(index) is self.saved_playlists_view:
@@ -453,6 +489,18 @@ class MainWindow(QMainWindow):
         self.db.set_favorite(track.id, track.favorite)
         self.library_view.set_favorite_state(track.id, track.favorite)
         self.playlist_builder.set_favorite_state(track.id, track.favorite)
+
+    def _on_cues_changed(self, track):
+        for item in (self.player.current_track, self.player.display_track, self.player._transition_track):
+            if item and item.id == track.id:
+                item.hot_cues = [cue.copy() for cue in track.hot_cues]
+        for view in (self.library_view, self.playlist_builder, self.queue_view):
+            view.set_hot_cues(track.id, track.hot_cues)
+        self.graph_view.mark_dirty()
+        for view in (self.library_view, self.playlist_builder):
+            dialog = view.waveform_dialog
+            if dialog and dialog._current_filepath == track.filepath:
+                dialog.chart.set_cues(track.hot_cues)
 
     def _on_list_favorite_changed(self, track_id: int, favorite: bool):
         self.player.set_favorite_state(track_id, favorite)

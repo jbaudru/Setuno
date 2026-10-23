@@ -8,11 +8,12 @@ from PySide6.QtCore import QElapsedTimer, QSize, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QFontMetrics
 from PySide6.QtMultimedia import QAudioBufferOutput, QAudioFormat, QAudioOutput, QMediaPlayer
 from PySide6.QtWidgets import (
-    QDialog, QHBoxLayout, QLabel, QPushButton, QSlider, QStyle, QStyleOptionSlider,
-    QVBoxLayout, QWidget,
+    QDialog, QHBoxLayout, QLabel, QMenu, QMessageBox, QPushButton, QSlider, QStyle, QStyleOptionSlider,
+    QToolButton, QVBoxLayout, QWidget,
 )
 
-from ..core.models import Track
+from ..core.database import Database
+from ..core.models import CUE_COLORS, CUE_LABELS, HotCue, Track, validate_hot_cues
 from .icon_loader import cover_pixmap, icon
 from .library_view import heart_icon
 from .waveform_view import _WaveformChart, _WaveformWorker
@@ -21,6 +22,29 @@ WAVEFORM_HEIGHT = 120
 DEFAULT_TRANSITION_DURATION_MS = 16000
 TRANSITION_DURATIONS_SECONDS = (8, 12, 16, 24, 32)
 TEMPO_RAMP_FRACTION = 0.2
+
+
+class _CueButton(QPushButton):
+    remove_requested = Signal()
+
+    def __init__(self, label: str):
+        super().__init__(label)
+        self.remove_btn = QToolButton(self)
+        self.remove_btn.setText("x")
+        self.remove_btn.setFixedSize(22, 22)
+        self.remove_btn.setToolTip(f"Remove cue {label}")
+        self.remove_btn.setAccessibleName(f"Remove cue {label}")
+        self.remove_btn.setStyleSheet(
+            "QToolButton { background: transparent; color: #101018; border: none; "
+            "border-radius: 3px; padding: 0; font-size: 18px; font-weight: bold; }"
+            "QToolButton:hover { background: transparent; color: #ffffff; }"
+        )
+        self.remove_btn.clicked.connect(self.remove_requested.emit)
+        self.remove_btn.hide()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.remove_btn.move(max(2, self.width() - self.remove_btn.width() - 2), 2)
 
 
 def _fmt_ms(ms: int) -> str:
@@ -55,9 +79,6 @@ def _transition_playback_rate(progress: float, matched_rate: float) -> float:
     if progress < ramp:
         amount = _smoothstep(progress / ramp)
         return 1.0 + (matched_rate - 1.0) * amount
-    if progress > 1.0 - ramp:
-        amount = _smoothstep((progress - (1.0 - ramp)) / ramp)
-        return matched_rate + (1.0 - matched_rate) * amount
     return matched_rate
 
 
@@ -267,11 +288,14 @@ class PlayerWidget(QWidget):
     audio_levels_changed = Signal(float, float)
     favorite_toggled = Signal(object)
     track_title_clicked = Signal(object)
+    cues_changed = Signal(object)
 
     def __init__(self, parent=None, *, auto_mix: bool = True, bpm_sync: bool = True,
                  energy_match: bool = False,
-                 transition_duration_ms: int = DEFAULT_TRANSITION_DURATION_MS):
+                 transition_duration_ms: int = DEFAULT_TRANSITION_DURATION_MS,
+                 db: Database | None = None):
         super().__init__(parent)
+        self.db = db
         self.current_track: Track | None = None
         self.display_track: Track | None = None
         self._full_title = "No track loaded"
@@ -284,6 +308,10 @@ class PlayerWidget(QWidget):
         self._transition_player = QMediaPlayer(self)
         self._transition_output = QAudioOutput(self)
         self._transition_player.setAudioOutput(self._transition_output)
+        for deck in (self.player, self._transition_player):
+            # Qt 6.10+ restarts its pitch stretcher on every playback-rate change.
+            if hasattr(deck, "setPitchCompensation"):
+                deck.setPitchCompensation(False)
         self._audio_buffer_output = QAudioBufferOutput(self)
         self._transition_buffer_output = QAudioBufferOutput(self)
         self.player.setAudioBufferOutput(self._audio_buffer_output)
@@ -304,6 +332,13 @@ class PlayerWidget(QWidget):
         self._transition_start_timer.setSingleShot(True)
         self._transition_start_timer.timeout.connect(self._begin_crossfade)
         self._transition_elapsed = QElapsedTimer()
+        self._tempo_restore_timer = QTimer(self)
+        self._tempo_restore_timer.setInterval(100)
+        self._tempo_restore_timer.timeout.connect(self._advance_tempo_restore)
+        self._tempo_restore_elapsed = QElapsedTimer()
+        self._tempo_restore_progress_ms = 0
+        self._tempo_restore_duration_ms = 0
+        self._tempo_restore_rate = 1.0
         requested_duration = int(transition_duration_ms)
         if requested_duration not in {seconds * 1000 for seconds in TRANSITION_DURATIONS_SECONDS}:
             requested_duration = DEFAULT_TRANSITION_DURATION_MS
@@ -397,9 +432,28 @@ class PlayerWidget(QWidget):
             bg_color="#33334d", bass_color="#8686AC", treble_color="#d8d8ec",
         )
         self.waveform_chart.setFixedHeight(WAVEFORM_HEIGHT)
+        self.waveform_chart.show_bar_numbers = False
         self.waveform_chart.setVisible(False)
         self.waveform_chart.seek_requested.connect(self._seek_to)
         self._waveform_workers: set = set()
+        self.cue_panel = QWidget()
+        self.cue_panel.setFixedHeight(40)
+        self.cue_panel.setVisible(False)
+        cue_row = QHBoxLayout(self.cue_panel)
+        cue_row.setContentsMargins(8, 4, 8, 4)
+        cue_row.setSpacing(6)
+        self.cue_buttons = []
+        for slot, label in enumerate(CUE_LABELS):
+            button = _CueButton(label)
+            button.remove_requested.connect(lambda slot=slot: self._save_cue(slot, remove=True))
+            button.setContextMenuPolicy(Qt.CustomContextMenu)
+            button.clicked.connect(lambda _checked=False, slot=slot: self._activate_cue(slot))
+            button.customContextMenuRequested.connect(
+                lambda point, slot=slot: self._cue_menu(slot, point)
+            )
+            cue_row.addWidget(button, 1)
+            self.cue_buttons.append(button)
+        self._refresh_cue_buttons()
 
         slider_col = QVBoxLayout()
         slider_col.setContentsMargins(0, 0, 0, 0)
@@ -430,6 +484,7 @@ class PlayerWidget(QWidget):
         layout.setSpacing(0)
         layout.addLayout(row)
         layout.addWidget(self.waveform_chart)
+        layout.addWidget(self.cue_panel)
         self._collapsed_height = 56
         self.setFixedHeight(self._collapsed_height)
 
@@ -451,6 +506,7 @@ class PlayerWidget(QWidget):
         """Queue a beat-aligned, level-matched transition to `track`."""
         if self.current_track is None or self.is_crossfading:
             return
+        self._tempo_restore_timer.stop()
         current_grid = _track_grid(self.current_track, self.waveform_chart._precise_grid)
         plan = _plan_auto_mix(
             self.current_track, track, self.player.position(), self.transition_duration_ms,
@@ -522,6 +578,7 @@ class PlayerWidget(QWidget):
         self._update_elided_title()
         self.cover_label.setPixmap(cover_pixmap(track.cover_path, 40) if track else cover_pixmap("", 40))
         self._update_like_button()
+        self._refresh_cue_buttons()
 
     def _on_title_clicked(self):
         track = self.display_track or self.current_track
@@ -599,13 +656,16 @@ class PlayerWidget(QWidget):
     def _load_waveform(self, track: Track):
         self.waveform_chart.set_beat_grid(None)
         self.waveform_chart.set_peaks(track.waveform_peaks)
+        self.waveform_chart.set_bands(track.waveform_bands)
+        self.waveform_chart.set_cues(track.hot_cues)
         self.waveform_chart.set_playhead(None)
         self.waveform_chart.set_bpm(track.tempo)
         self.waveform_chart.set_beat_offset(track.beat_offset)
         self.waveform_chart.set_duration(track.duration)
 
-        worker = _WaveformWorker(track.filepath, track.tempo)
+        worker = _WaveformWorker(track.filepath, track.tempo, refine_tempo=not track.tempo_manual)
         worker.done.connect(self._on_waveform_peaks)
+        worker.bands_ready.connect(self._on_waveform_bands)
         worker.finished.connect(lambda: self._waveform_workers.discard(worker))
         self._waveform_workers.add(worker)
         worker.start()
@@ -617,6 +677,11 @@ class PlayerWidget(QWidget):
                 self.waveform_chart.set_peaks(peaks)
             self.waveform_chart.set_detail_peaks(detail)
             self.waveform_chart.set_beat_grid(grid)
+
+    def _on_waveform_bands(self, filepath: str, bands: list):
+        track = self.display_track or self.current_track
+        if track and track.filepath == filepath:
+            self.waveform_chart.set_bands(bands)
 
     def _seek_to(self, seconds: float):
         if self.current_track is None:
@@ -770,10 +835,10 @@ class PlayerWidget(QWidget):
         outgoing_gain, incoming_gain = _transition_gains(progress)
         self.audio_output.setVolume(volume * outgoing_gain)
         self._transition_output.setVolume(volume * incoming_gain)
-        if self._transition_plan and progress < 1.0:
-            self._transition_player.setPlaybackRate(
-                _transition_playback_rate(progress, self._transition_plan.playback_rate)
-            )
+        if self._transition_plan:
+            rate = _transition_playback_rate(progress, self._transition_plan.playback_rate)
+            if not math.isclose(self._transition_player.playbackRate(), rate, abs_tol=0.0001):
+                self._transition_player.setPlaybackRate(rate)
         if progress >= 1.0:
             track = self._transition_track
             if self.display_track is not track:
@@ -797,8 +862,26 @@ class PlayerWidget(QWidget):
             self._transition_elapsed.invalidate()
             self._crossfade_requested = False
             outgoing_player.stop()
+            self._tempo_restore_rate = self.player.playbackRate()
+            self._tempo_restore_progress_ms = 0
+            self._tempo_restore_duration_ms = max(2000, round(duration_ms * TEMPO_RAMP_FRACTION))
+            self._tempo_restore_elapsed.start()
+            if self._tempo_restore_rate != 1.0:
+                self._tempo_restore_timer.start()
             self._sync_progress_from_player(self.player)
             self.track_transitioned.emit(track)
+
+    def _advance_tempo_restore(self):
+        elapsed = self._tempo_restore_elapsed.restart()
+        if not self._is_playing():
+            return
+        self._tempo_restore_progress_ms += elapsed
+        progress = min(1.0, self._tempo_restore_progress_ms / self._tempo_restore_duration_ms)
+        rate = 1.0 + (self._tempo_restore_rate - 1.0) * (1.0 - _smoothstep(progress))
+        if progress >= 1.0 or not math.isclose(self.player.playbackRate(), rate, abs_tol=0.0001):
+            self.player.setPlaybackRate(rate)
+        if progress >= 1.0:
+            self._tempo_restore_timer.stop()
 
     def _toggle_favorite(self):
         track = self.display_track or self.current_track
@@ -823,6 +906,9 @@ class PlayerWidget(QWidget):
         self.like_btn.setToolTip("Remove from favorites" if liked else "Add to favorites")
 
     def _cancel_crossfade(self):
+        self._tempo_restore_timer.stop()
+        if self.player.playbackRate() != 1.0:
+            self.player.setPlaybackRate(1.0)
         self._transition_start_timer.stop()
         self._transition_timer.stop()
         self._set_progress_blink(False)
@@ -856,13 +942,88 @@ class PlayerWidget(QWidget):
             self.crossfade_btn.setToolTip("Auto-crossfade: Off")
 
     def _toggle_extended(self):
-        expanded = not self.waveform_chart.isVisible()
+        expanded = self.waveform_chart.isHidden()
         self.waveform_chart.setVisible(expanded)
+        self.cue_panel.setVisible(expanded)
         self.expand_btn.setIcon(icon("chevron-down") if expanded else icon("chevron-up"))
         self.expand_btn.setToolTip("Hide waveform" if expanded else "Show waveform")
         self.setFixedHeight(
-            self._collapsed_height + WAVEFORM_HEIGHT if expanded else self._collapsed_height
+            self._collapsed_height + WAVEFORM_HEIGHT + self.cue_panel.height()
+            if expanded else self._collapsed_height
         )
+
+    def _cue_deck(self):
+        track = self.display_track or self.current_track
+        if track is not None and track is self._transition_track and track is not self.current_track:
+            return self._transition_player
+        return self.player
+
+    def _refresh_cue_buttons(self):
+        track = self.display_track or self.current_track
+        cues = {cue["slot"]: cue["time"] for cue in track.hot_cues} if track else {}
+        for slot, button in enumerate(self.cue_buttons):
+            time = cues.get(slot)
+            color = CUE_COLORS[slot]
+            button.setEnabled(track is not None)
+            button.remove_btn.setVisible(time is not None)
+            button.setStyleSheet(
+                f"QPushButton {{ border: 2px solid {color}; border-radius: 4px; padding: 3px; "
+                f"background: {color if time is not None else 'transparent'}; "
+                f"color: {'#101018' if time is not None else color}; font-weight: bold; }}"
+            )
+            label = CUE_LABELS[slot]
+            text = (f"Cue {label}: {time:.3f}s - click to jump; x to remove; right-click to replace"
+                    if time is not None else f"Set cue {label} at the current position")
+            button.setToolTip(text)
+            button.setAccessibleName(text)
+
+    def _save_cue(self, slot: int, remove: bool = False):
+        track = self.display_track or self.current_track
+        if track is None:
+            return
+        cues: list[HotCue] = [cue for cue in track.hot_cues if cue["slot"] != slot]
+        if not remove:
+            cues.append({"slot": slot, "time": self._cue_deck().position() / 1000.0})
+        try:
+            cues = validate_hot_cues(cues, track.duration)
+            if self.db is not None:
+                if track.id is None:
+                    raise ValueError("Save this track to the library before setting cues.")
+                self.db.set_hot_cues(track.id, cues)
+        except (OSError, ValueError, KeyError) as exc:
+            QMessageBox.warning(self, "Could not save cue", str(exc))
+            return
+        track.hot_cues = cues
+        self.waveform_chart.set_cues(cues)
+        self._refresh_cue_buttons()
+        self.cues_changed.emit(track)
+
+    def _activate_cue(self, slot: int):
+        track = self.display_track or self.current_track
+        if track is None:
+            return
+        cue = next((cue for cue in track.hot_cues if cue["slot"] == slot), None)
+        if cue is None:
+            self._save_cue(slot)
+        elif self._cue_deck() is self.player:
+            self._seek_to(cue["time"])
+        else:
+            self._cue_deck().setPosition(round(cue["time"] * 1000))
+            self.waveform_chart.set_playhead(cue["time"])
+
+    def _cue_menu(self, slot, point):
+        track = self.display_track or self.current_track
+        if track is None:
+            return
+        menu = QMenu(self)
+        replace = menu.addAction("Set at current position")
+        remove = menu.addAction("Remove cue")
+        remove.setEnabled(any(cue["slot"] == slot for cue in track.hot_cues))
+        action = menu.exec(self.cue_buttons[slot].mapToGlobal(point))
+        if action is replace:
+            self._save_cue(slot)
+        elif action is remove:
+            self._save_cue(slot, remove=True)
 
     def apply_theme(
         self, accent_color: str,
@@ -879,6 +1040,7 @@ class PlayerWidget(QWidget):
         self._update_crossfade_button(self.crossfade_btn.isChecked())
         self.volume_label.setPixmap(icon("volume").pixmap(16, 16))
         self._update_like_button()
+        self._refresh_cue_buttons()
         expanded = self.waveform_chart.isVisible()
         self.expand_btn.setIcon(icon("chevron-down") if expanded else icon("chevron-up"))
         if bg and bass and treble:

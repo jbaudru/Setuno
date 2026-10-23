@@ -7,7 +7,10 @@ from .database import default_data_dir
 _DEFAULTS = {
     "theme": "light", "library_folders": [],
     "show_level_meter": True,
+    "multicolor_waveforms": False,
     "library_visible_columns": None,
+    "playlists_view_mode": "list",
+    "graph_layout": "classical",
     "auto_mix": True,
     "auto_mix_bpm_sync": True,
     "auto_mix_energy_match": False,

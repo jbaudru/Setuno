@@ -169,9 +169,19 @@ class QueueView(QWidget):
                 MiniWaveform(
                     track.waveform_peaks or track.waveform_low,
                     self._wave_bass, self._wave_treble, self._wave_bg,
+                    bands=track.waveform_bands,
+                    cues=track.hot_cues, duration=track.duration,
                 ),
             )
         self.count_changed.emit(len(self._track_ids))
+
+    def set_hot_cues(self, track_id, cues):
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, WAVEFORM_COL)
+            if item and item.data(1000) == track_id:
+                waveform = self.table.cellWidget(row, WAVEFORM_COL)
+                if isinstance(waveform, MiniWaveform):
+                    waveform.set_cues(cues)
 
     def apply_theme(self, bg: str, bass: str, treble: str):
         self._wave_bg, self._wave_bass, self._wave_treble = bg, bass, treble

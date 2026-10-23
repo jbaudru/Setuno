@@ -18,7 +18,7 @@ from ..core.scanner import is_readable_file, scan_folder, is_within_folder
 from ..core.models import Track
 from .icon_loader import icon, cover_pixmap
 from .track_edit import edit_bpm, edit_key, edit_metadata
-from .waveform_view import MiniWaveformDelegate, WaveformDialog, reduce_peaks
+from .waveform_view import MiniWaveformDelegate, WaveformDialog, reduce_bands, reduce_peaks
 
 COLUMNS = ["\u2665", "Title", "Artist", "Album", "Genre", "BPM", "Key", "Camelot", "Energy", "Duration", "Added", "Duplicates", "Waveform"]
 FAV_COL = 0
@@ -451,6 +451,16 @@ class LibraryView(QWidget):
         self._matched_tracks = []
         self.refresh_table()
 
+    def set_hot_cues(self, track_id, cues):
+        for track in self.tracks:
+            if track.id == track_id:
+                track.hot_cues = [cue.copy() for cue in cues]
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, WAVEFORM_COL)
+            if item and item.data(1000) == track_id:
+                item.setData(MiniWaveformDelegate.CUES_ROLE,
+                             tuple((cue["slot"], cue["time"]) for cue in cues))
+
     def refresh_table(self):
         query = self.search_edit.text().strip().casefold()
         folder_filter = self.folder_combo.currentData()
@@ -535,6 +545,10 @@ class LibraryView(QWidget):
             id_item = QTableWidgetItem("")
             id_item.setData(1000, t.id)
             id_item.setData(MiniWaveformDelegate.PEAKS_ROLE, self._mini_peaks.get(t.id, ()))
+            id_item.setData(MiniWaveformDelegate.BANDS_ROLE, reduce_bands(t.waveform_bands))
+            id_item.setData(MiniWaveformDelegate.CUES_ROLE,
+                            tuple((cue["slot"], cue["time"]) for cue in t.hot_cues))
+            id_item.setData(MiniWaveformDelegate.DURATION_ROLE, t.duration)
             id_item.setToolTip("Click to open the full waveform")
             self.table.setItem(r, WAVEFORM_COL, id_item)
         self.table.setSortingEnabled(True)
